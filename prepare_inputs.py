@@ -54,6 +54,57 @@ from sklearn.model_selection import StratifiedKFold
 # ----------------------------
 # IO utilities
 # ----------------------------
+# --- ID canonicalization helpers ---
+import logging
+
+def build_id_canonicalizer(pattern=None, case_sensitive=False):
+    """
+    Returns a function that extracts a canonical subject ID from any longer string.
+    If `pattern` is provided, it must have exactly one capturing group (group 1).
+    Applied to BOTH covariates IDs and feature IDs (from filenames or tables).
+    """
+    rx_list = []
+    if pattern:
+        rx_list.append(re.compile(pattern))
+
+    # sensible defaults: BIDS-ish, H####_y# form, fallback to first token
+    rx_list += [
+        re.compile(r'^(sub-[A-Za-z0-9]+(?:[_-]ses-[A-Za-z0-9]+)?)'),  # sub-XXX[_ses-YY]
+        re.compile(r'^([A-Za-z0-9]+[_-]y[0-9]+)'),                   # H1234_y2 or H1234-y2
+        re.compile(r'^([A-Za-z0-9]+)')                               # fallback: first token
+    ]
+
+    def _canon(x):
+        s = "" if x is None else str(x)
+        for rx in rx_list:
+            m = rx.match(s)
+            if m:
+                s = m.group(1)
+                break
+        # normalize whitespace
+        s = s.strip()
+        if not case_sensitive:
+            s = s.lower()
+        return s
+    return _canon
+
+
+def load_clean_covars(covars_path, id_col="subject_id", site_col="SITE", age_col="AGE",
+                      dropna=True, id_extractor=None, case_sensitive=False):
+    import pandas as pd
+
+    df = pd.read_csv(covars_path)
+    # Create a canonical ID column that strips any extensions in subject_id
+    canon = build_id_canonicalizer(pattern=id_extractor, case_sensitive=case_sensitive)
+    df["__id__"] = df[id_col].astype(str).map(canon)
+
+    # optional: enforce dtypes / dropna as you already do
+    if dropna:
+        df = df.dropna(subset=[site_col, age_col, id_col])
+
+    return df
+
+
 
 def _read_matrix(path: Path) -> np.ndarray:
     """Read a single square adjacency matrix from .csv/.tsv/.npy (returns 2D np.ndarray)."""
@@ -304,7 +355,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise SystemExit(f"Unsupported --connectomes input: {conn}")
 
     # Load & clean covars
-    cov = load_clean_covars(Path(args.covars), id_col=args.id_col, site_col=args.site_col, age_col=args.age_col, dropna=True)
+    cov = load_clean_covars(
+        Path(args.covars),
+        id_col=args.id_col,
+        site_col=args.site_col,
+        age_col=args.age_col,
+        dropna=True,
+        id_extractor=getattr(args, "id_extractor", None),
+        case_sensitive=getattr(args, "case_sensitive", False),
+    )
 
     # Align subjects
     feats2, cov2, kept = align_subjects(feats, cov, id_col=args.id_col)
