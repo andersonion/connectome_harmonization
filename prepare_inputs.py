@@ -284,21 +284,51 @@ def load_clean_covars(
     return df
 
 
-def align_subjects(features: pd.DataFrame, covars: pd.DataFrame, id_col: str = "subject_id") -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
-    """Intersect subjects present in both; keep aligned order."""
-    common = features.index.intersection(covars.index)
-    if len(common) == 0:
-        raise ValueError("No overlapping subject IDs between features and covariates.")
-    if len(common) < len(features):
-        print(f"[warn] {len(features)-len(common)} subjects in features missing in covariates; dropped.", file=sys.stderr)
-    if len(common) < len(covars):
-        print(f"[warn] {len(covars)-len(common)} subjects in covariates missing in features; dropped.", file=sys.stderr)
-    feats2 = features.loc[common].copy()
-    cov2 = covars.loc[common].copy()
-    # Ensure exact same sorted order
-    feats2 = feats2.sort_index()
-    cov2 = cov2.sort_index()
-    return feats2, cov2, common.tolist()
+def align_subjects(feats_df, cov_df, id_col="subject_id",
+                   id_extractor=None, case_sensitive=False):
+    """
+    Align by canonical IDs. Drops non-overlapping rows on either side.
+    Never raises on partial mismatch; only warns if overlap == 0.
+    """
+    canon = build_id_canonicalizer(pattern=id_extractor, case_sensitive=case_sensitive)
+
+    f = feats_df.copy()
+    c = cov_df.copy()
+
+    # Ensure both sides have a canonical id column
+    if "__id__" not in f.columns:
+        f["__id__"] = f[id_col].astype(str).map(canon)
+    if "__id__" not in c.columns:
+        c["__id__"] = c[id_col].astype(str).map(canon)
+
+    f_ids = set(f["__id__"])
+    c_ids = set(c["__id__"])
+    kept = sorted(f_ids & c_ids)
+
+    if not kept:
+        # Be explicit but do not crash here; caller can decide to exit gracefully
+        msg = (
+            "No overlapping subject IDs after canonicalization.\n"
+            f"Examples feats-only: {sorted((f_ids - c_ids))[:10]}\n"
+            f"Examples covs-only : {sorted((c_ids - f_ids))[:10]}\n"
+            "Tip: pass --id-extractor '^([A-Za-z0-9]+_y[0-9]+)' "
+            "if your covars have suffixes like '_conn_plain'."
+        )
+        logging.warning(msg)
+        # Return empty aligned frames so downstream can detect and skip
+        return f.iloc[0:0].copy(), c.iloc[0:0].copy(), []
+
+    # Drop non-overlapping
+    f2 = f[f["__id__"].isin(kept)].copy()
+    c2 = c[c["__id__"].isin(kept)].copy()
+
+    # Helpful log
+    logging.info(
+        "Aligned subjects: kept=%d, dropped feats=%d, dropped covs=%d",
+        len(kept), len(f) - len(f2), len(c) - len(c2),
+    )
+
+    return f2, c2, kept
 
 
 # ----------------------------
@@ -332,6 +362,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--age_col", default="AGE")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--include_diagonal", action="store_true", help="Include diagonal in feature vector (default off).")
+    ap.add_argument(
+        "--id-extractor",
+        default=None,
+        help="Regex with ONE capturing group that extracts the canonical subject ID "
+             "from a longer string (applied to BOTH covars and features). "
+             "Example: '^([A-Za-z0-9]+_y[0-9]+)' turns 'H4567_y2_conn_plain' -> 'H4567_y2'.",
+    )
+    ap.add_argument(
+        "--case-sensitive",
+        action="store_true",
+        help="Match IDs case-sensitively. Default is case-insensitive.",
+    )
+
     args = ap.parse_args(argv)
 
     outdir = Path(args.outdir)
@@ -366,7 +409,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     # Align subjects
-    feats2, cov2, kept = align_subjects(feats, cov, id_col=args.id_col)
+    feats2, cov2, kept = align_subjects(
+        feats, cov, id_col=args.id_col,
+        id_extractor=getattr(args, "id_extractor", None),
+        case_sensitive=getattr(args, "case_sensitive", False),
+    )
+    if len(kept) == 0:
+        # exit cleanly with a readable message instead of a stack trace
+        raise SystemExit("No overlapping IDs after cleaning; nothing to do. "
+                         "Try --id-extractor '^([A-Za-z0-9]+_y[0-9]+)'.")
 
     # Folds
     folds_df = make_folds(cov2, site_col=args.site_col, n_splits=args.folds)
