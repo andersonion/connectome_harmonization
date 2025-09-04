@@ -59,21 +59,19 @@ import logging
 
 def build_id_canonicalizer(pattern=None, case_sensitive=False):
     """
-    Returns a function that extracts a canonical subject ID from any longer string.
+    Returns a function that extracts a canonical subject ID from a longer string.
     If `pattern` is provided, it must have exactly one capturing group (group 1).
-    Applied to BOTH covariates IDs and feature IDs (from filenames or tables).
+    Applied to BOTH covars and features.
     """
     rx_list = []
     if pattern:
         rx_list.append(re.compile(pattern))
-
-    # sensible defaults: BIDS-ish, H####_y# form, fallback to first token
+    # sensible fallbacks:
     rx_list += [
-        re.compile(r'^(sub-[A-Za-z0-9]+(?:[_-]ses-[A-Za-z0-9]+)?)'),  # sub-XXX[_ses-YY]
-        re.compile(r'^([A-Za-z0-9]+[_-]y[0-9]+)'),                   # H1234_y2 or H1234-y2
-        re.compile(r'^([A-Za-z0-9]+)')                               # fallback: first token
+        re.compile(r'^(sub-[A-Za-z0-9]+(?:[_-]ses-[A-Za-z0-9]+)?)'),  # sub-xxx[_ses-yy]
+        re.compile(r'^([A-Za-z0-9]+[_-]y[0-9]+)'),                    # H1234_y2 or H1234-y2
+        re.compile(r'^([A-Za-z0-9]+)')                                # fallback: first token
     ]
-
     def _canon(x):
         s = "" if x is None else str(x)
         for rx in rx_list:
@@ -81,7 +79,6 @@ def build_id_canonicalizer(pattern=None, case_sensitive=False):
             if m:
                 s = m.group(1)
                 break
-        # normalize whitespace
         s = s.strip()
         if not case_sensitive:
             s = s.lower()
@@ -89,18 +86,24 @@ def build_id_canonicalizer(pattern=None, case_sensitive=False):
     return _canon
 
 
-def load_clean_covars(covars_path, id_col="subject_id", site_col="SITE", age_col="AGE",
-                      dropna=True, id_extractor=None, case_sensitive=False):
-    import pandas as pd
 
+def load_clean_covars(
+    covars_path,
+    id_col="subject_id",
+    site_col="SITE",
+    age_col="AGE",
+    dropna=True,
+    id_extractor=None,          # <-- NEW
+    case_sensitive=False,       # <-- NEW
+):
+    import pandas as pd
     df = pd.read_csv(covars_path)
-    # Create a canonical ID column that strips any extensions in subject_id
+
     canon = build_id_canonicalizer(pattern=id_extractor, case_sensitive=case_sensitive)
     df["__id__"] = df[id_col].astype(str).map(canon)
 
-    # optional: enforce dtypes / dropna as you already do
     if dropna:
-        df = df.dropna(subset=[site_col, age_col, id_col])
+        df = df.dropna(subset=[id_col, site_col, age_col])
 
     return df
 
@@ -284,18 +287,18 @@ def load_clean_covars(
     return df
 
 
-def align_subjects(feats_df, cov_df, id_col="subject_id",
-                   id_extractor=None, case_sensitive=False):
-    """
-    Align by canonical IDs. Drops non-overlapping rows on either side.
-    Never raises on partial mismatch; only warns if overlap == 0.
-    """
+def align_subjects(
+    feats_df,
+    cov_df,
+    id_col="subject_id",
+    id_extractor=None,          # <-- NEW
+    case_sensitive=False,       # <-- NEW
+):
     canon = build_id_canonicalizer(pattern=id_extractor, case_sensitive=case_sensitive)
 
     f = feats_df.copy()
     c = cov_df.copy()
 
-    # Ensure both sides have a canonical id column
     if "__id__" not in f.columns:
         f["__id__"] = f[id_col].astype(str).map(canon)
     if "__id__" not in c.columns:
@@ -306,29 +309,22 @@ def align_subjects(feats_df, cov_df, id_col="subject_id",
     kept = sorted(f_ids & c_ids)
 
     if not kept:
-        # Be explicit but do not crash here; caller can decide to exit gracefully
-        msg = (
-            "No overlapping subject IDs after canonicalization.\n"
-            f"Examples feats-only: {sorted((f_ids - c_ids))[:10]}\n"
-            f"Examples covs-only : {sorted((c_ids - f_ids))[:10]}\n"
-            "Tip: pass --id-extractor '^([A-Za-z0-9]+_y[0-9]+)' "
-            "if your covars have suffixes like '_conn_plain'."
+        logging.warning(
+            "No overlapping IDs after canonicalization. "
+            "feats-only (up to 10): %s ; covs-only (up to 10): %s",
+            sorted(f_ids - c_ids)[:10], sorted(c_ids - f_ids)[:10]
         )
-        logging.warning(msg)
-        # Return empty aligned frames so downstream can detect and skip
+        # Return empty frames rather than raising
         return f.iloc[0:0].copy(), c.iloc[0:0].copy(), []
 
-    # Drop non-overlapping
     f2 = f[f["__id__"].isin(kept)].copy()
     c2 = c[c["__id__"].isin(kept)].copy()
-
-    # Helpful log
     logging.info(
         "Aligned subjects: kept=%d, dropped feats=%d, dropped covs=%d",
         len(kept), len(f) - len(f2), len(c) - len(c2),
     )
-
     return f2, c2, kept
+
 
 
 # ----------------------------
