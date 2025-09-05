@@ -4,35 +4,34 @@
 """
 Fold-wise ComBat / ComBat-GAM CV with optional anchoring to a reference batch.
 
-Usage (examples):
-  # Using numeric features table (rows=subjects, cols=edges), batches in SITE:
-  python foldwise_combat_gam_cv.py \
-    --features /path/features_numeric.csv \
-    --covars   /path/covars_all.csv \
-    --site-col SITE --age-col AGE --id-col subject_id \
-    --folds 5 --mode gam \
-    --ref-batch ADDecode:1 \
-    --out-dir harmonized_cv --prefix ADDECODE_ADNI_HABS
+Examples:
 
-  # Using a MANIFEST (subject_id,__id__,filepath) – auto-vectorizes (upper triangle):
-  python foldwise_combat_gam_cv.py \
-    --features /path/features_manifest.csv \
-    --covars   /path/covars_all.csv \
-    --site-col BATCH --age-col AGE --id-col subject_id \
-    --folds 5 --mode gam \
-    --ref-batch ADDecode:1 \
-    --vectorize upper \
-    --out-dir harmonized_cv --prefix ADDECODE_ADNI_HABS
+# Numeric features (rows=subjects, cols=edges), batches in SITE (ADDecode=1):
+python foldwise_combat_gam_cv.py \
+  --features /path/features_numeric.csv \
+  --covars   /path/covars_all.csv \
+  --site-col SITE --age-col AGE --id-col subject_id \
+  --folds 5 --mode gam \
+  --ref-batch 1 \
+  --out-dir harmonized_cv --prefix ADDECODE_ADNI_HABS
+
+# MANIFEST (subject_id,__id__,filepath) – auto-vectorize (upper triangle):
+python foldwise_combat_gam_cv.py \
+  --features /path/features_manifest.csv \
+  --covars   /path/covars_all.csv \
+  --site-col BATCH --age-col AGE --id-col subject_id \
+  --folds 5 --mode gam \
+  --ref-batch ADDecode:1 \
+  --vectorize upper \
+  --out-dir harmonized_cv --prefix ADDECODE_ADNI_HABS
 """
 
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 import logging
 from pathlib import Path
-from typing import Tuple, List
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -42,7 +41,7 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
-# neuroHarmonize (ComBat-GAM fit/apply)
+# neuroHarmonize (import inside calls as well for clearer error if missing deps)
 from neuroHarmonize import harmonizationLearn, harmonizationApply
 
 
@@ -55,40 +54,6 @@ def setup_logging(verbosity: int) -> None:
 
 # ------------------------- Feature Loading ----------------------------- #
 
-def read_numeric_or_manifest(features_path: Path, id_col: str, vectorize: str) -> pd.DataFrame:
-    """
-    Load features as a numeric table.
-    If the file looks like a manifest (has 'filepath'), we load each file and vectorize.
-
-    Returns a DataFrame with: [id_col, <numeric feature columns>]
-    """
-    df = pd.read_csv(features_path)
-    # Manifest?
-    if "filepath" in df.columns:
-        logging.info("Detected MANIFEST (has 'filepath'); vectorizing per-subject files (mode=%s).", vectorize)
-        need = {id_col, "filepath"}
-        if not need.issubset(df.columns):
-            raise SystemExit(f"Manifest must contain columns {need}. Found: {list(df.columns)}")
-        return build_numeric_from_manifest(df[[id_col, "filepath"]].copy(), id_col=id_col, mode=vectorize)
-
-    # Already numeric table: coerce and drop non-numeric columns (except id_col).
-    if id_col not in df.columns:
-        raise SystemExit(f"Features table missing id-col '{id_col}'. Columns: {list(df.columns)[:10]}")
-
-    id_series = df[id_col].astype(str)
-    num = df.drop(columns=[id_col]).apply(pd.to_numeric, errors="coerce")
-    bad = [c for c in num.columns if num[c].isnull().any()]
-    if bad:
-        logging.warning("Dropping %d non-numeric/NaN columns from features: %s",
-                        len(bad), ", ".join(bad[:8]) + ("..." if len(bad) > 8 else ""))
-        num = num.drop(columns=bad)
-
-    out = pd.concat([id_series, num], axis=1)
-    if out.shape[1] <= 1:
-        raise SystemExit("No numeric feature columns remained after coercion.")
-    return out
-
-
 def _read_numeric_file(fp: str) -> np.ndarray:
     # Try CSV then TSV (no header)
     try:
@@ -99,9 +64,13 @@ def _read_numeric_file(fp: str) -> np.ndarray:
 
 def _vectorize_array(A: np.ndarray, mode: str) -> np.ndarray:
     A = np.asarray(A, float)
+    if mode == "auto":
+        if A.ndim == 2 and A.shape[0] == A.shape[1]:
+            mode = "upper"
+        else:
+            mode = "flatten"
     if mode == "flatten" or A.ndim == 1 or 1 in A.shape:
         return A.ravel()
-    # default: treat as square adjacency and take upper triangle without diag
     if A.ndim == 2 and A.shape[0] == A.shape[1]:
         r, c = np.triu_indices_from(A, k=1)
         return A[r, c]
@@ -127,21 +96,51 @@ def build_numeric_from_manifest(manifest_df: pd.DataFrame, id_col: str, mode: st
     return X
 
 
+def read_numeric_or_manifest(features_path: Path, id_col: str, vectorize: str) -> pd.DataFrame:
+    """
+    Load features as a numeric table.
+    If the file looks like a manifest (has 'filepath'), load each file and vectorize.
+
+    Returns DataFrame: [id_col, <numeric features...>]
+    """
+    df = pd.read_csv(features_path)
+    if "filepath" in df.columns:
+        logging.info("Detected MANIFEST (has 'filepath'); vectorizing per-subject files (mode=%s).", vectorize)
+        need = {id_col, "filepath"}
+        if not need.issubset(df.columns):
+            raise SystemExit(f"Manifest must contain columns {need}. Found: {list(df.columns)}")
+        return build_numeric_from_manifest(df[[id_col, "filepath"]].copy(), id_col=id_col, mode=vectorize)
+
+    if id_col not in df.columns:
+        raise SystemExit(f"Features table missing id-col '{id_col}'. Columns: {list(df.columns)[:10]}")
+
+    id_series = df[id_col].astype(str)
+    num = df.drop(columns=[id_col]).apply(pd.to_numeric, errors="coerce")
+    bad = [c for c in num.columns if num[c].isnull().any()]
+    if bad:
+        logging.warning("Dropping %d non-numeric/NaN feature columns: %s",
+                        len(bad), ", ".join(bad[:8]) + ("..." if len(bad) > 8 else ""))
+        num = num.drop(columns=bad)
+    out = pd.concat([id_series, num], axis=1)
+    if out.shape[1] <= 1:
+        raise SystemExit("No numeric feature columns remained after coercion.")
+    return out
+
+
 # ------------------------------ Metrics -------------------------------- #
 
-def site_auc_on_test(Xtr, ytr, Xte, yte) -> float:
+def site_auc_on_test(Xtr: np.ndarray, ytr, Xte: np.ndarray, yte) -> float:
     """
     Train a site classifier on (Xtr,ytr) and compute ROC-AUC on (Xte,yte).
     Uses predict_proba. Returns NaN if the test fold has <2 classes.
+    Handles test-time subset of training classes.
     """
-    import numpy as np
-    from sklearn.preprocessing import LabelEncoder
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import roc_auc_score
+    ytr = np.asarray(ytr)
+    yte = np.asarray(yte)
 
     le = LabelEncoder()
-    ytr_enc = le.fit_transform(np.asarray(ytr))
-    yte_enc = le.transform(np.asarray(yte))
+    ytr_enc = le.fit_transform(ytr)
+    yte_enc = le.transform(yte)
 
     te_classes = np.unique(yte_enc)
     if len(te_classes) < 2:
@@ -150,22 +149,15 @@ def site_auc_on_test(Xtr, ytr, Xte, yte) -> float:
     clf = LogisticRegression(max_iter=2000, multi_class="auto")
     clf.fit(Xtr, ytr_enc)
 
-    prob_full = clf.predict_proba(Xte)  # shape: (n_samples, n_train_classes)
-
+    prob_full = clf.predict_proba(Xte)  # (n_samples, n_train_classes)
     if len(le.classes_) == 2:
-        # binary: column 1 is the positive class
+        # Binary: column 1 is the positive class
         return float(roc_auc_score(yte_enc, prob_full[:, 1]))
     else:
-        # multiclass: subset prob columns to the classes present in y_test
-        # (te_classes are encoded indices matching columns of predict_proba)
+        # Multiclass: subset prob to only the classes present in test
         prob_sub = prob_full[:, te_classes]
-        return float(roc_auc_score(
-            yte_enc,
-            prob_sub,
-            multi_class="ovr",
-            average="macro",
-            labels=te_classes
-        ))
+        # Let sklearn infer labels from y_true; columns now match that set
+        return float(roc_auc_score(yte_enc, prob_sub, multi_class="ovr", average="macro"))
 
 
 # ------------------------------ Main ----------------------------------- #
@@ -174,7 +166,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="Fold-wise ComBat / ComBat-GAM CV with optional anchoring to a reference batch."
     )
-    ap.add_argument("--features", required=True, help="Features CSV (numeric table) or MANIFEST (with 'filepath').")
+    ap.add_argument("--features", required=True, help="Features CSV (numeric) or MANIFEST (with 'filepath').")
     ap.add_argument("--covars", required=True, help="Covariates CSV.")
     ap.add_argument("--id-col", default="subject_id", help="ID column (must exist in both tables).")
     ap.add_argument("--site-col", default="SITE", help="Batch/site column in covars.")
@@ -230,7 +222,7 @@ def main():
     if ref_label is not None and ref_label not in set(C_df[args.site_col].unique()):
         raise SystemExit(f"--ref-batch '{ref_label}' not found in {args.site_col} values.")
 
-    # Matrix for ML
+    # Feature matrix for ML
     X = X_df.drop(columns=[args.id_col])
     if not np.issubdtype(X.dtypes.values[0], np.number):
         X = X.apply(pd.to_numeric, errors="coerce")
@@ -267,12 +259,13 @@ def main():
         ref_n = int(np.sum(cv_sites == ref_label))
         if ref_n < args.folds:
             logging.warning("Reference batch '%s' has only %d sample(s); "
-                            "StratifiedKFold(n_splits=%d) may fail.", ref_label, ref_n, args.folds)
+                            "StratifiedKFold(n_splits=%d) may warn/fail.",
+                            ref_label, ref_n, args.folds)
 
     # ---------------- Build CV splitter ---------------- #
     skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=42)
 
-    per_fold = []
+    per_fold: List[dict] = []
     for fold, (tr_idx, te_idx) in enumerate(skf.split(X.values, cv_sites), start=1):
         Xtr = X.iloc[tr_idx].values.astype(np.float32)
         Xte = X.iloc[te_idx].values.astype(np.float32)
@@ -284,30 +277,52 @@ def main():
         pre_auc = site_auc_on_test(Xtr, cv_sites[tr_idx], Xte, cv_sites[te_idx])
 
         # --------------- Harmonization (fit on train, apply to test) --------------- #
-        # Ensure site col is str for harmonization call
-        cov_tr[args.site_col] = cov_tr[args.site_col].astype(str)
-        cov_te[args.site_col] = cov_te[args.site_col].astype(str)
+        # Keep originals intact; ensure site col is str
+        cov_tr0 = cov_tr.copy()
+        cov_te0 = cov_te.copy()
+        cov_tr0[args.site_col] = cov_tr0[args.site_col].astype(str)
+        cov_te0[args.site_col] = cov_te0[args.site_col].astype(str)
 
-        if args.mode == "gam":
-            # ComBat-GAM with spline(age)
-            model, Xtr_adj = harmonizationLearn(
-                Xtr,
-                cov_tr,
-                smooth_terms=[args.age_col],
-                batch_col=args.site_col,
+        def _fit_apply(Xtr_arr, cov_tr_df, Xte_arr, cov_te_df, smooth_terms, site_col, ref_label):
+            """
+            Try neuroHarmonize NEW API (batch_col=...), then fall back to OLD API
+            where the batch column must be named 'SITE'.
+            """
+            # Try NEW API first
+            try:
+                model, Xtr_adj_ = harmonizationLearn(
+                    Xtr_arr,
+                    cov_tr_df,
+                    smooth_terms=smooth_terms,
+                    batch_col=site_col,
+                    ref_batch=ref_label
+                )
+                Xte_adj_ = harmonizationApply(Xte_arr, cov_te_df, model)
+                return Xtr_adj_, Xte_adj_
+            except TypeError as e:
+                if "batch_col" not in str(e):
+                    raise  # some other error; surface it
+
+            # OLD API fallback: rename batch column to literal 'SITE'
+            cov_tr_old = cov_tr_df.rename(columns={site_col: "SITE"})
+            cov_te_old = cov_te_df.rename(columns={site_col: "SITE"})
+            model, Xtr_adj_ = harmonizationLearn(
+                Xtr_arr,
+                cov_tr_old,
+                smooth_terms=smooth_terms,
                 ref_batch=ref_label
             )
-            Xte_adj = harmonizationApply(Xte, cov_te, model)
-        else:
-            # "anchored" = no spline term; still allow anchoring to ref_batch
-            model, Xtr_adj = harmonizationLearn(
-                Xtr,
-                cov_tr,
-                smooth_terms=[],               # no spline(age)
-                batch_col=args.site_col,
-                ref_batch=ref_label
-            )
-            Xte_adj = harmonizationApply(Xte, cov_te, model)
+            Xte_adj_ = harmonizationApply(Xte_arr, cov_te_old, model)
+            return Xtr_adj_, Xte_adj_
+
+        smooth_terms = [args.age_col] if args.mode == "gam" else []  # GAM spline(age) vs linear
+        Xtr_adj, Xte_adj = _fit_apply(
+            Xtr, cov_tr0,
+            Xte, cov_te0,
+            smooth_terms=smooth_terms,
+            site_col=args.site_col,
+            ref_label=ref_label
+        )
 
         # Post-harmonization AUC
         post_auc = site_auc_on_test(Xtr_adj, cv_sites[tr_idx], Xte_adj, cv_sites[te_idx])
@@ -319,13 +334,14 @@ def main():
             "pre_auc": float(pre_auc) if pre_auc == pre_auc else None,
             "post_auc": float(post_auc) if post_auc == post_auc else None,
         })
-        logging.info("Fold %d: pre_auc=%.4f, post_auc=%.4f", fold,
-                     per_fold[-1]["pre_auc"] or float("nan"),
-                     per_fold[-1]["post_auc"] or float("nan"))
+        logging.info("Fold %d: pre_auc=%s, post_auc=%s",
+                     fold,
+                     f"{per_fold[-1]['pre_auc']:.4f}" if per_fold[-1]['pre_auc'] is not None else "nan",
+                     f"{per_fold[-1]['post_auc']:.4f}" if per_fold[-1]['post_auc'] is not None else "nan")
 
     # ---------------- Save results ---------------- #
     res = pd.DataFrame(per_fold)
-    res_path = outdir / f"{args.prefix}_cv_auc.csv"
+    res_path = Path(args.out_dir) / f"{args.prefix}_cv_auc.csv"
     res.to_csv(res_path, index=False)
     print(f"Wrote {res_path}")
 
