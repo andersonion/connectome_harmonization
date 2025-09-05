@@ -1,271 +1,289 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-foldwise_combat_gam_cv.py
+Fold-wise ComBat / ComBat-GAM CV with optional anchoring to a reference batch.
 
-Fold-aware harmonization for connectome features using ComBat-GAM (neuroHarmonize)
-with optional anchored ComBat (spline(age) + neuroCombat w/ ref_batch).
+Usage (examples):
+  # Using numeric features table (rows=subjects, cols=edges), batches in SITE:
+  python foldwise_combat_gam_cv.py \
+    --features /path/features_numeric.csv \
+    --covars   /path/covars_all.csv \
+    --site-col SITE --age-col AGE --id-col subject_id \
+    --folds 5 --mode gam \
+    --ref-batch ADDecode:1 \
+    --out-dir harmonized_cv --prefix ADDECODE_ADNI_HABS
 
-Key idea: fit harmonization ONLY on training subjects in each fold,
-then apply the learned model to that fold's held-out test subjects.
-
-Requirements
------------
-pip install neuroHarmonize neuroCombat patsy pandas numpy scikit-learn matplotlib
-
-Inputs
-------
---features: CSV of subjects x edge features. Index column = subject IDs.
---covars:   CSV of covariates with columns: subject_id, SITE, AGE, [optional covars]
---folds:    Number of StratifiedKFold splits by SITE (default 5).
-
-Outputs (under --out-dir)
--------------------------
-- <prefix>_fold<k>_train_harmonized.csv
-- <prefix>_fold<k>_test_harmonized.csv
-- <prefix>_fold<k>_prepost_auc.txt (site separability AUC before vs after on TEST set)
-- <prefix>_fold<k>_pca_pre.png and _pca_post.png (TEST set PCA colored by SITE)
-- <prefix>_alltest_harmonized.csv (concatenated test splits, in original subject order)
-- <prefix>_summary.csv (per-fold AUCs and counts)
-
-Notes
------
-- If your features are correlations, Fisher-z transform before harmonization.
-- Ensure identical edge ordering across cohorts.
-- For anchored mode we approximate GAM with spline(age) in neuroCombat and use
-  ref_batch to map into a chosen reference site (e.g., AD-DECODE).
-
-Example
--------
-python foldwise_combat_gam_cv.py \
-  --features edges.csv \
-  --covars covars.csv \
-  --site-col SITE --age-col AGE --id-col subject_id \
-  --folds 5 --mode gam \
-  --out-dir harmonized_cv --prefix ADNI_ADDECODE
-
-python foldwise_combat_gam_cv.py \
-  --features edges.csv \
-  --covars covars.csv \
-  --site-col SITE --age-col AGE --id-col subject_id \
-  --folds 5 --mode anchored --ref-batch AD-DECODE \
-  --out-dir harmonized_cv --prefix ADNI_to_ADDECODE
+  # Using a MANIFEST (subject_id,__id__,filepath) – auto-vectorizes (upper triangle):
+  python foldwise_combat_gam_cv.py \
+    --features /path/features_manifest.csv \
+    --covars   /path/covars_all.csv \
+    --site-col BATCH --age-col AGE --id-col subject_id \
+    --folds 5 --mode gam \
+    --ref-batch ADDecode:1 \
+    --vectorize upper \
+    --out-dir harmonized_cv --prefix ADDECODE_ADNI_HABS
 """
 
-import argparse, os, pickle
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import logging
+from pathlib import Path
+from typing import Tuple, List
+
 import numpy as np
 import pandas as pd
+
 from sklearn.model_selection import StratifiedKFold
-from sklearn.decomposition import PCA
+from sklearn.preprocessing import LabelEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
-import matplotlib.pyplot as plt
 
-def pca_scatter(X, sites, title, save_path):
-    pca = PCA(n_components=2, random_state=42)
-    Z = pca.fit_transform(X)
-    plt.figure(figsize=(7, 5))
-    # Plot each site with default colors
-    for s in np.unique(sites):
-        idx = np.where(sites == s)[0]
-        plt.scatter(Z[idx, 0], Z[idx, 1], label=str(s), alpha=0.7)
-    plt.xlabel("PC1")
-    plt.ylabel("PC2")
-    plt.title(title)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150)
-    plt.close()
+# neuroHarmonize (ComBat-GAM fit/apply)
+from neuroHarmonize import harmonizationLearn, harmonizationApply
 
-def site_auc_on_test(Xtr, ytr, Xte, yte):
-    import numpy as np
-    from sklearn.preprocessing import LabelEncoder
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import roc_auc_score
 
-    # Encode labels to 0..K-1
+# ----------------------------- Logging -------------------------------- #
+
+def setup_logging(verbosity: int) -> None:
+    level = logging.WARNING if verbosity <= 0 else logging.INFO if verbosity == 1 else logging.DEBUG
+    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+
+
+# ------------------------- Feature Loading ----------------------------- #
+
+def read_numeric_or_manifest(features_path: Path, id_col: str, vectorize: str) -> pd.DataFrame:
+    """
+    Load features as a numeric table.
+    If the file looks like a manifest (has 'filepath'), we load each file and vectorize.
+
+    Returns a DataFrame with: [id_col, <numeric feature columns>]
+    """
+    df = pd.read_csv(features_path)
+    # Manifest?
+    if "filepath" in df.columns:
+        logging.info("Detected MANIFEST (has 'filepath'); vectorizing per-subject files (mode=%s).", vectorize)
+        need = {id_col, "filepath"}
+        if not need.issubset(df.columns):
+            raise SystemExit(f"Manifest must contain columns {need}. Found: {list(df.columns)}")
+        return build_numeric_from_manifest(df[[id_col, "filepath"]].copy(), id_col=id_col, mode=vectorize)
+
+    # Already numeric table: coerce and drop non-numeric columns (except id_col).
+    if id_col not in df.columns:
+        raise SystemExit(f"Features table missing id-col '{id_col}'. Columns: {list(df.columns)[:10]}")
+
+    id_series = df[id_col].astype(str)
+    num = df.drop(columns=[id_col]).apply(pd.to_numeric, errors="coerce")
+    bad = [c for c in num.columns if num[c].isnull().any()]
+    if bad:
+        logging.warning("Dropping %d non-numeric/NaN columns from features: %s",
+                        len(bad), ", ".join(bad[:8]) + ("..." if len(bad) > 8 else ""))
+        num = num.drop(columns=bad)
+
+    out = pd.concat([id_series, num], axis=1)
+    if out.shape[1] <= 1:
+        raise SystemExit("No numeric feature columns remained after coercion.")
+    return out
+
+
+def _read_numeric_file(fp: str) -> np.ndarray:
+    # Try CSV then TSV (no header)
+    try:
+        return pd.read_csv(fp, header=None).values
+    except Exception:
+        return pd.read_csv(fp, sep="\t", header=None).values
+
+
+def _vectorize_array(A: np.ndarray, mode: str) -> np.ndarray:
+    A = np.asarray(A, float)
+    if mode == "flatten" or A.ndim == 1 or 1 in A.shape:
+        return A.ravel()
+    # default: treat as square adjacency and take upper triangle without diag
+    if A.ndim == 2 and A.shape[0] == A.shape[1]:
+        r, c = np.triu_indices_from(A, k=1)
+        return A[r, c]
+    return A.ravel()
+
+
+def build_numeric_from_manifest(manifest_df: pd.DataFrame, id_col: str, mode: str = "upper") -> pd.DataFrame:
+    rows, ids = [], []
+    first_len = None
+    for _, rec in manifest_df.iterrows():
+        fp = rec["filepath"]
+        A = _read_numeric_file(fp)
+        v = _vectorize_array(A, mode)
+        if first_len is None:
+            first_len = v.size
+        elif v.size != first_len:
+            raise SystemExit(f"Feature length mismatch at {fp}: {v.size} vs {first_len}")
+        rows.append(v.astype(np.float32))
+        ids.append(str(rec[id_col]))
+    cols = [f"e{i:06d}" for i in range(first_len)]
+    X = pd.DataFrame(rows, columns=cols)
+    X.insert(0, id_col, ids)
+    return X
+
+
+# ------------------------------ Metrics -------------------------------- #
+
+def site_auc_on_test(Xtr: np.ndarray, ytr, Xte: np.ndarray, yte) -> float:
+    """
+    AUC of a site classifier trained on train fold and evaluated on test fold.
+    Uses predict_proba; returns np.nan if the test fold has <2 classes.
+    """
+    ytr = np.asarray(ytr)
+    yte = np.asarray(yte)
+
     le = LabelEncoder()
     ytr_enc = le.fit_transform(ytr)
     yte_enc = le.transform(yte)
 
-    # If test fold has <2 classes, AUC is undefined; skip this fold
     if len(np.unique(yte_enc)) < 2:
-        return np.nan
+        return float("nan")
 
-    # Use a classifier that **supports predict_proba**
     clf = LogisticRegression(max_iter=2000, multi_class="auto")
     clf.fit(Xtr, ytr_enc)
-
     if len(le.classes_) == 2:
-        # Binary: pass the positive-class probability
         prob = clf.predict_proba(Xte)[:, 1]
         return float(roc_auc_score(yte_enc, prob))
     else:
-        # Multiclass: pass full probability matrix (rows sum to 1)
-        prob = clf.predict_proba(Xte)  # shape (n_samples, n_classes)
+        prob = clf.predict_proba(Xte)
         return float(roc_auc_score(yte_enc, prob, multi_class="ovr", average="macro"))
 
 
-def encode_covars(covars, site_col, age_col):
-    cov = covars.copy()
-    cov = cov.rename(columns={site_col: 'SITE'})
-    keep = ['SITE', age_col]
-    other = [c for c in cov.columns if c not in keep]
-    if other:
-        cov = pd.concat([cov[keep], pd.get_dummies(cov[other], drop_first=True)], axis=1)
-    else:
-        cov = cov[keep]
-    return cov
-
-def fit_apply_gam(Xtr, Xte, cov_tr, cov_te, age_col, smooth_bounds=None):
-    from neuroHarmonize import harmonizationLearn, applyHarmonizationModel
-    kwargs = dict(smooth_terms=[age_col])
-    if smooth_bounds is not None:
-        kwargs['smooth_term_bounds'] = smooth_bounds
-    model, Xtr_adj = harmonizationLearn(Xtr, cov_tr, **kwargs)
-    Xte_adj = applyHarmonizationModel(Xte, cov_te, model)
-    return Xtr_adj, Xte_adj, model
-
-def fit_apply_anchored(Xtr, Xte, cov_tr, cov_te, ref_batch, site_col='SITE', age_col='AGE'):
-    from patsy import dmatrix
-    from neuroCombat import neuroCombat, neuroCombatFromTraining
-
-    # Build spline basis on train, apply to test
-    age_tr = cov_tr[age_col].astype(float)
-    age_te = cov_te[age_col].astype(float)
-    spline_tr = dmatrix("bs(age, df=5, degree=3, include_intercept=False)",
-                        {"age": age_tr}, return_type='dataframe')
-    spline_te = dmatrix("bs(age, df=5, degree=3, include_intercept=False)",
-                        {"age": age_te}, return_type='dataframe')
-    spline_tr.columns = [f"AGE_s{i}" for i in range(spline_tr.shape[1])]
-    spline_te.columns = spline_tr.columns
-
-    # Design matrices: SITE + spline(age) + other linear covars
-    def build_design(cov, spline):
-        design = pd.concat([cov[[site_col]], spline], axis=1)
-        other = [c for c in cov.columns if c not in [site_col, age_col]]
-        if other:
-            design = pd.concat([design, pd.get_dummies(cov[other], drop_first=True)], axis=1)
-        return design
-
-    dtr = build_design(cov_tr, spline_tr)
-    dte = build_design(cov_te, spline_te)
-
-    # Fit on training
-    out_tr = neuroCombat(dat=Xtr.T, covars=dtr, batch_col=site_col,
-                         continuous_cols=[c for c in dtr.columns if c.startswith('AGE_s')],
-                         categorical_cols=[c for c in dtr.columns if c not in (['SITE'] + [c for c in dtr.columns if c.startswith('AGE_s')])],
-                         ref_batch=ref_batch, return_s_data=True)
-    Xtr_adj = out_tr['data'].T
-    params = out_tr['estimates']  # parameters for fromTraining
-
-    # Apply to test
-    out_te = neuroCombatFromTraining(dat=Xte.T, covars=dte, batch_col=site_col,
-                                     estimates=params, ref_batch=ref_batch, return_s_data=True)
-    Xte_adj = out_te['data'].T
-    return Xtr_adj, Xte_adj, params
+# ------------------------------ Main ----------------------------------- #
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--features', required=True, help='CSV: subjects x edges, index=subject_id')
-    ap.add_argument('--covars', required=True, help='CSV: covariates incl. subject_id, SITE, AGE')
-    ap.add_argument('--id-col', default='subject_id')
-    ap.add_argument('--site-col', default='SITE')
-    ap.add_argument('--age-col', default='AGE')
-    ap.add_argument('--folds', type=int, default=5)
-    ap.add_argument('--mode', choices=['gam', 'anchored'], default='gam')
-    ap.add_argument('--ref-batch', default=None, help='Required if mode=anchored (e.g., AD-DECODE)')
-    ap.add_argument('--age-min', type=float, default=None)
-    ap.add_argument('--age-max', type=float, default=None)
-    ap.add_argument('--out-dir', required=True)
-    ap.add_argument('--prefix', required=True)
+    ap = argparse.ArgumentParser(
+        description="Fold-wise ComBat / ComBat-GAM CV with optional anchoring to a reference batch."
+    )
+    ap.add_argument("--features", required=True, help="Features CSV (numeric table) or MANIFEST (with 'filepath').")
+    ap.add_argument("--covars", required=True, help="Covariates CSV.")
+    ap.add_argument("--id-col", default="subject_id", help="ID column (must exist in both tables).")
+    ap.add_argument("--site-col", default="SITE", help="Batch/site column in covars.")
+    ap.add_argument("--age-col", default="AGE", help="Age column in covars.")
+    ap.add_argument("--folds", type=int, default=5, help="Number of CV folds (stratified by site).")
+    ap.add_argument("--mode", choices=["gam", "anchored"], default="gam",
+                    help="gam: ComBat-GAM with spline(age); anchored: linear (no spline).")
+    ap.add_argument("--ref-batch", default=None,
+                    help="Reference batch label to anchor to (e.g., 'ADDecode:1' or '1').")
+    ap.add_argument("--age-min", type=float, default=None, help="Optional min age filter.")
+    ap.add_argument("--age-max", type=float, default=None, help="Optional max age filter.")
+    ap.add_argument("--vectorize", choices=["upper", "flatten", "auto"], default="upper",
+                    help="If --features is a MANIFEST, how to vectorize per-subject files.")
+    ap.add_argument("--cv-handle-rare", choices=["merge", "drop", "ignore"], default="merge",
+                    help="How to handle tiny site classes for CV labels (does not touch harmonization labels).")
+    ap.add_argument("--min-per-site", type=int, default=2, help="Sites with < this many samples are 'rare'.")
+    ap.add_argument("--out-dir", required=True, help="Output directory for per-fold results.")
+    ap.add_argument("--prefix", required=True, help="Prefix for outputs.")
+    ap.add_argument("-v", "--verbose", action="count", default=1, help="Increase verbosity (-v, -vv).")
+
     args = ap.parse_args()
+    setup_logging(args.verbose)
 
-    os.makedirs(args.out_dir, exist_ok=True)
+    features_path = Path(args.features)
+    covars_path = Path(args.covars)
+    outdir = Path(args.out_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    X = pd.read_csv(args.features, index_col=0)
-    C = pd.read_csv(args.covars)
-    C = C.set_index(args.id_col)
-    # Align subjects
-    common = X.index.intersection(C.index)
-    X = X.loc[common].copy()
-    C = C.loc[common].copy()
+    # Load inputs
+    X_df = read_numeric_or_manifest(features_path, id_col=args.id_col, vectorize=args.vectorize)
+    C_df = pd.read_csv(covars_path)
 
-    sites = C[args.site_col].astype(str).values
-    ages  = C[args.age_col].astype(float).values
+    # Optional age filter
+    if args.age_min is not None:
+        C_df = C_df[C_df[args.age_col] >= args.age_min]
+    if args.age_max is not None:
+        C_df = C_df[C_df[args.age_col] <= args.age_max]
 
-    # Summary containers
-    records = []
-    all_test_adj = []
+    # Align by id
+    X_df[args.id_col] = X_df[args.id_col].astype(str)
+    C_df[args.id_col] = C_df[args.id_col].astype(str)
 
+    keep_ids = sorted(set(X_df[args.id_col]) & set(C_df[args.id_col]))
+    if not keep_ids:
+        raise SystemExit("No overlapping subject IDs between features and covars after loading.")
+
+    X_df = X_df.set_index(args.id_col).loc[keep_ids].reset_index()
+    C_df = C_df.set_index(args.id_col).loc[keep_ids].reset_index()
+
+    # Harmonization labels (batch) as strings; DO NOT TOUCH for harmonization
+    C_df[args.site_col] = C_df[args.site_col].astype(str)
+    ref_label = None if args.ref_batch is None else str(args.ref_batch)
+    if ref_label is not None and ref_label not in set(C_df[args.site_col].unique()):
+        raise SystemExit(f"--ref-batch '{ref_label}' not found in {args.site_col} values.")
+
+    # Matrix for ML
+    X = X_df.drop(columns=[args.id_col])
+    if not np.issubdtype(X.dtypes.values[0], np.number):
+        X = X.apply(pd.to_numeric, errors="coerce")
+    if X.isnull().any().any():
+        n_bad = int(X.isnull().any(axis=1).sum())
+        if n_bad:
+            logging.warning("Dropping %d rows with NaNs in features after coercion.", n_bad)
+            mask = ~X.isnull().any(axis=1)
+            X = X.loc[mask].reset_index(drop=True)
+            C_df = C_df.loc[mask].reset_index(drop=True)
+
+    # ---------------- CV labels (only for splitting & AUC) ---------------- #
+    sites_raw = C_df[args.site_col].astype(str).values
+    sites_series = pd.Series(sites_raw)
+    counts = sites_series.value_counts()
+    rare = [lab for lab, cnt in counts.items() if cnt < args.min_per_site and lab != ref_label]
+
+    if args.cv_handle_rare == "drop" and rare:
+        keep_mask = ~sites_series.isin(rare)
+        logging.info("Dropping %d subjects from rare CV classes (<%d): %s",
+                     int((~keep_mask).sum()), args.min_per_site, sorted(rare))
+        X = X.loc[keep_mask].reset_index(drop=True)
+        C_df = C_df.loc[keep_mask].reset_index(drop=True)
+        cv_sites = sites_series[keep_mask].astype(str).values
+    elif args.cv_handle_rare == "merge" and rare:
+        logging.info("Merging rare CV classes (<%d) into 'OTHER': %s",
+                     args.min_per_site, sorted(rare))
+        sites_series.loc[sites_series.isin(rare)] = "OTHER"
+        cv_sites = sites_series.astype(str).values
+    else:
+        cv_sites = sites_series.astype(str).values
+
+    if ref_label is not None:
+        ref_n = int(np.sum(cv_sites == ref_label))
+        if ref_n < args.folds:
+            logging.warning("Reference batch '%s' has only %d sample(s); "
+                            "StratifiedKFold(n_splits=%d) may fail.", ref_label, ref_n, args.folds)
+
+    # ---------------- Build CV splitter ---------------- #
     skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=42)
-    for fold, (tr_idx, te_idx) in enumerate(skf.split(X.values, sites), start=1):
+
+    per_fold = []
+    for fold, (tr_idx, te_idx) in enumerate(skf.split(X.values, cv_sites), start=1):
         Xtr = X.iloc[tr_idx].values.astype(np.float32)
         Xte = X.iloc[te_idx].values.astype(np.float32)
 
-        Ctr_raw = C.iloc[tr_idx].copy()
-        Cte_raw = C.iloc[te_idx].copy()
+        cov_tr = C_df.iloc[tr_idx].copy()
+        cov_te = C_df.iloc[te_idx].copy()
 
-        # Pre-harmonization test AUC
-        pre_auc = site_auc_on_test(Xtr, sites[tr_idx], Xte, sites[te_idx])
+        # Pre-harmonization AUC (site predictability)
+        pre_auc = site_auc_on_test(Xtr, cv_sites[tr_idx], Xte, cv_sites[te_idx])
 
-        if args.mode == 'gam':
-            cov_tr = encode_covars(Ctr_raw[[args.site_col, args.age_col] + [c for c in Ctr_raw.columns if c not in [args.site_col, args.age_col]]],
-                                   args.site_col, args.age_col)
-            cov_te = encode_covars(Cte_raw[[args.site_col, args.age_col] + [c for c in Cte_raw.columns if c not in [args.site_col, args.age_col]]],
-                                   args.site_col, args.age_col)
-            smooth_bounds = None
-            if args.age_min is not None and args.age_max is not None:
-                smooth_bounds = (args.age_min, args.age_max)
-            Xtr_adj, Xte_adj, model = fit_apply_gam(Xtr, Xte, cov_tr, cov_te, age_col=args.age_col,
-                                                    smooth_bounds=smooth_bounds)
-            # Save model
-            with open(os.path.join(args.out_dir, f"{args.prefix}_fold{fold}_gam_model.pkl"), 'wb') as f:
-                pickle.dump(model, f)
+        # --------------- Harmonization (fit on train, apply to test) --------------- #
+        # Ensure site col is str for harmonization call
+        cov_tr[args.site_col] = cov_tr[args.site_col].astype(str)
+        cov_te[args.site_col] = cov_te[args.site_col].astype(str)
+
+        if args.mode == "gam":
+            # ComBat-GAM with spline(age)
+            model, Xtr_adj = harmonizationLearn(
+                Xtr,
+                cov_tr,
+                smooth_terms=[args.age_col],
+                batch_col=args.site_col,
+                ref_batch=ref_label
+            )
+            Xte_adj = harmonizationApply(Xte, cov_te, model)
         else:
-            if args.ref_batch is None:
-                raise SystemExit("--mode anchored requires --ref-batch")
-            # For anchored, keep raw covars; function will build spline + design matrices
-            Xtr_adj, Xte_adj, params = fit_apply_anchored(Xtr, Xte,
-                                                          Ctr_raw[[args.site_col, args.age_col] + [c for c in Ctr_raw.columns if c not in [args.site_col, args.age_col]]],
-                                                          Cte_raw[[args.site_col, args.age_col] + [c for c in Cte_raw.columns if c not in [args.site_col, args.age_col]]],
-                                                          ref_batch=args.ref_batch,
-                                                          site_col=args.site_col, age_col=args.age_col)
-            with open(os.path.join(args.out_dir, f"{args.prefix}_fold{fold}_anchored_params.pkl"), 'wb') as f:
-                pickle.dump(params, f)
-
-        # Post-harmonization test AUC (site separability should drop)
-        post_auc = site_auc_on_test(Xtr_adj, sites[tr_idx], Xte_adj, sites[te_idx])
-
-        # Save dataframes with subject indices
-        Xtr_adj_df = pd.DataFrame(Xtr_adj, index=X.index[tr_idx], columns=X.columns)
-        Xte_adj_df = pd.DataFrame(Xte_adj, index=X.index[te_idx], columns=X.columns)
-        Xtr_adj_df.to_csv(os.path.join(args.out_dir, f"{args.prefix}_fold{fold}_train_harmonized.csv"))
-        Xte_adj_df.to_csv(os.path.join(args.out_dir, f"{args.prefix}_fold{fold}_test_harmonized.csv"))
-
-        # PCA plots on TEST set (pre vs post)
-        pca_scatter(Xte, sites[te_idx], f"Fold {fold} TEST PCA (pre-harmonization)",
-                    os.path.join(args.out_dir, f"{args.prefix}_fold{fold}_pca_pre.png"))
-        pca_scatter(Xte_adj, sites[te_idx], f"Fold {fold} TEST PCA (post-harmonization)",
-                    os.path.join(args.out_dir, f"{args.prefix}_fold{fold}_pca_post.png"))
-
-        # Write a tiny report
-        with open(os.path.join(args.out_dir, f"{args.prefix}_fold{fold}_prepost_auc.txt"), 'w') as f:
-            f.write(f"Fold {fold}\n")
-            f.write(f"Pre-harmonization TEST AUC:  {pre_auc:.3f}\n")
-            f.write(f"Post-harmonization TEST AUC: {post_auc:.3f}\n")
-            f.write(f"N_train={len(tr_idx)}, N_test={len(te_idx)}\n")
-
-        # For concatenated test set output
-        all_test_adj.append(Xte_adj_df)
-        records.append(dict(fold=fold, pre_auc=pre_auc, post_auc=post_auc,
-                            n_train=len(tr_idx), n_test=len(te_idx)))
-
-    # Concatenate test splits in original subject order
-    all_test_df = pd.concat(all_test_adj).loc[X.index]
-    all_test_df.to_csv(os.path.join(args.out_dir, f"{args.prefix}_alltest_harmonized.csv"))
-
-    # Summary CSV
-    pd.DataFrame.from_records(records).to_csv(os.path.join(args.out_dir, f"{args.prefix}_summary.csv"), index=False)
-
-if __name__ == "__main__":
-    main()
+            # "anchored" = no spline term; still allow anchoring to ref_batch
+            model, Xtr_adj = harmonizationLearn(
