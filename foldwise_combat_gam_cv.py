@@ -4,26 +4,15 @@
 """
 Fold-wise ComBat / ComBat-GAM CV with optional anchoring to a reference batch.
 
-Examples:
+Supports:
+- Numeric features table (rows=subjects, cols=edges)
+- MANIFEST (subject_id,__id__,filepath) with auto-vectorization (upper triangle by default)
 
-# Numeric features (rows=subjects, cols=edges), batches in SITE (ADDecode=1):
-python foldwise_combat_gam_cv.py \
-  --features /path/features_numeric.csv \
-  --covars   /path/covars_all.csv \
-  --site-col SITE --age-col AGE --id-col subject_id \
-  --folds 5 --mode gam \
-  --ref-batch 1 \
-  --out-dir harmonized_cv --prefix ADDECODE_ADNI_HABS
-
-# MANIFEST (subject_id,__id__,filepath) – auto-vectorize (upper triangle):
-python foldwise_combat_gam_cv.py \
-  --features /path/features_manifest.csv \
-  --covars   /path/covars_all.csv \
-  --site-col BATCH --age-col AGE --id-col subject_id \
-  --folds 5 --mode gam \
-  --ref-batch ADDecode:1 \
-  --vectorize upper \
-  --out-dir harmonized_cv --prefix ADDECODE_ADNI_HABS
+Key behavior:
+- Keeps harmonization labels intact; only adjusts CV labels if you ask (merge/drop rares)
+- Multiclass AUC uses predict_proba and matches columns to test classes
+- neuroHarmonize API compatible (new: batch_col=..., old: needs column literally 'SITE')
+- Only passes necessary covariates to harmonization to avoid dtype issues
 """
 
 from __future__ import annotations
@@ -41,8 +30,7 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
-# neuroHarmonize (import inside calls as well for clearer error if missing deps)
-from neuroHarmonize import harmonizationLearn, harmonizationApply
+from neuroHarmonize import harmonizationLearn, harmonizationApply  # import early to fail fast if deps missing
 
 
 # ----------------------------- Logging -------------------------------- #
@@ -55,7 +43,6 @@ def setup_logging(verbosity: int) -> None:
 # ------------------------- Feature Loading ----------------------------- #
 
 def _read_numeric_file(fp: str) -> np.ndarray:
-    # Try CSV then TSV (no header)
     try:
         return pd.read_csv(fp, header=None).values
     except Exception:
@@ -97,12 +84,6 @@ def build_numeric_from_manifest(manifest_df: pd.DataFrame, id_col: str, mode: st
 
 
 def read_numeric_or_manifest(features_path: Path, id_col: str, vectorize: str) -> pd.DataFrame:
-    """
-    Load features as a numeric table.
-    If the file looks like a manifest (has 'filepath'), load each file and vectorize.
-
-    Returns DataFrame: [id_col, <numeric features...>]
-    """
     df = pd.read_csv(features_path)
     if "filepath" in df.columns:
         logging.info("Detected MANIFEST (has 'filepath'); vectorizing per-subject files (mode=%s).", vectorize)
@@ -151,12 +132,10 @@ def site_auc_on_test(Xtr: np.ndarray, ytr, Xte: np.ndarray, yte) -> float:
 
     prob_full = clf.predict_proba(Xte)  # (n_samples, n_train_classes)
     if len(le.classes_) == 2:
-        # Binary: column 1 is the positive class
         return float(roc_auc_score(yte_enc, prob_full[:, 1]))
     else:
-        # Multiclass: subset prob to only the classes present in test
+        # subset prob columns to classes present in test (encoded indices)
         prob_sub = prob_full[:, te_classes]
-        # Let sklearn infer labels from y_true; columns now match that set
         return float(roc_auc_score(yte_enc, prob_sub, multi_class="ovr", average="macro"))
 
 
@@ -222,6 +201,18 @@ def main():
     if ref_label is not None and ref_label not in set(C_df[args.site_col].unique()):
         raise SystemExit(f"--ref-batch '{ref_label}' not found in {args.site_col} values.")
 
+    # Ensure AGE is numeric (fail fast with helpful message)
+    if args.age_col in C_df.columns:
+        C_df[args.age_col] = pd.to_numeric(C_df[args.age_col], errors="coerce")
+        bad_age = C_df[args.age_col].isna()
+        if bad_age.any():
+            n_bad = int(bad_age.sum())
+            examples = C_df.loc[bad_age, [args.id_col, args.age_col]].head(5).to_dict(orient="records")
+            raise SystemExit(
+                f"AGE column contains non-numeric or missing values in {n_bad} row(s). "
+                f"Examples: {examples}. Fix covars or choose a correct --age-col."
+            )
+
     # Feature matrix for ML
     X = X_df.drop(columns=[args.id_col])
     if not np.issubdtype(X.dtypes.values[0], np.number):
@@ -277,18 +268,29 @@ def main():
         pre_auc = site_auc_on_test(Xtr, cv_sites[tr_idx], Xte, cv_sites[te_idx])
 
         # --------------- Harmonization (fit on train, apply to test) --------------- #
-        # Keep originals intact; ensure site col is str
         cov_tr0 = cov_tr.copy()
         cov_te0 = cov_te.copy()
         cov_tr0[args.site_col] = cov_tr0[args.site_col].astype(str)
         cov_te0[args.site_col] = cov_te0[args.site_col].astype(str)
 
+        # Keep only the needed covariates for harmonization:
+        keep_cols = [args.site_col]
+        if args.age_col in cov_tr0.columns:
+            keep_cols.append(args.age_col)
+        if "SEX" in cov_tr0.columns:
+            keep_cols.append("SEX")
+        cov_tr_use = cov_tr0[keep_cols].copy()
+        cov_te_use = cov_te0[keep_cols].copy()
+
+        # Ensure AGE numeric (again, on the split)
+        if args.age_col in cov_tr_use.columns:
+            cov_tr_use[args.age_col] = pd.to_numeric(cov_tr_use[args.age_col], errors="coerce")
+            cov_te_use[args.age_col] = pd.to_numeric(cov_te_use[args.age_col], errors="coerce")
+            if cov_tr_use[args.age_col].isna().any() or cov_te_use[args.age_col].isna().any():
+                raise SystemExit("Non-numeric AGE encountered after split; check covariates.")
+
         def _fit_apply(Xtr_arr, cov_tr_df, Xte_arr, cov_te_df, smooth_terms, site_col, ref_label):
-            """
-            Try neuroHarmonize NEW API (batch_col=...), then fall back to OLD API
-            where the batch column must be named 'SITE'.
-            """
-            # Try NEW API first
+            # Try NEW API (supports batch_col)
             try:
                 model, Xtr_adj_ = harmonizationLearn(
                     Xtr_arr,
@@ -315,10 +317,10 @@ def main():
             Xte_adj_ = harmonizationApply(Xte_arr, cov_te_old, model)
             return Xtr_adj_, Xte_adj_
 
-        smooth_terms = [args.age_col] if args.mode == "gam" else []  # GAM spline(age) vs linear
+        smooth_terms = [args.age_col] if (args.mode == "gam" and args.age_col in cov_tr_use.columns) else []
         Xtr_adj, Xte_adj = _fit_apply(
-            Xtr, cov_tr0,
-            Xte, cov_te0,
+            Xtr, cov_tr_use,
+            Xte, cov_te_use,
             smooth_terms=smooth_terms,
             site_col=args.site_col,
             ref_label=ref_label
@@ -345,7 +347,6 @@ def main():
     res.to_csv(res_path, index=False)
     print(f"Wrote {res_path}")
 
-    # Summary
     pre_mean = np.nanmean(res["pre_auc"].values.astype(float))
     post_mean = np.nanmean(res["post_auc"].values.astype(float))
     print(f"Mean AUC: pre={pre_mean:.4f} post={post_mean:.4f}")
