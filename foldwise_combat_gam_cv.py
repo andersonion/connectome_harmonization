@@ -272,15 +272,15 @@ def main():
         cov_te0 = cov_te.copy()
         cov_tr0[args.site_col] = cov_tr0[args.site_col].astype(str)
         cov_te0[args.site_col] = cov_te0[args.site_col].astype(str)
-
-        # Keep only the needed covariates for harmonization:
+        
+        # Keep only batch + AGE (exclude SEX to avoid numeric-cast error)
         keep_cols = [args.site_col]
         if args.age_col in cov_tr0.columns:
             keep_cols.append(args.age_col)
-        if "SEX" in cov_tr0.columns:
-            keep_cols.append("SEX")
+        
         cov_tr_use = cov_tr0[keep_cols].copy()
         cov_te_use = cov_te0[keep_cols].copy()
+
 
         # Ensure AGE numeric (again, on the split)
         if args.age_col in cov_tr_use.columns:
