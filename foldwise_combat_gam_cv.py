@@ -213,4 +213,181 @@ def main():
     ref_label = None if args.ref_batch is None else str(args.ref_batch)
     if ref_label is not None and ref_label not in set(C_df[args.site_col].unique()):
         print(f"[error] --ref-batch '{ref_label}' not found in column '{args.site_col}'.", flush=True)
-        uniq = C_df[args.site_col].value_counts().head]()_
+        uniq = C_df[args.site_col].value_counts().head(20)
+        print(f"[hint] Top site labels:\n{uniq}", flush=True)
+        sys.exit(2)
+
+    # Ensure AGE numeric
+    if args.age_col in C_df.columns:
+        C_df[args.age_col] = pd.to_numeric(C_df[args.age_col], errors="coerce")
+        bad_age = C_df[args.age_col].isna()
+        if bad_age.any():
+            examples = C_df.loc[bad_age, [args.id_col, args.age_col]].head(5)
+            print("[error] AGE has non-numeric/missing values. Examples:\n", examples, flush=True)
+            sys.exit(2)
+
+    # Feature matrix
+    X = X_df.drop(columns=[args.id_col])
+    if not np.issubdtype(X.dtypes.values[0], np.number):
+        X = X.apply(pd.to_numeric, errors="coerce")
+    if X.isnull().any().any():
+        n_bad = int(X.isnull().any(axis=1).sum())
+        if n_bad:
+            logging.warning("Dropping %d rows with NaNs in features after coercion.", n_bad)
+            mask = ~X.isnull().any(axis=1)
+            X = X.loc[mask].reset_index(drop=True)
+            C_df = C_df.loc[mask].reset_index(drop=True)
+
+    # ---------------- CV labels (only for splitting & AUC) ---------------- #
+    banner("CV LABELS")
+    sites_raw = C_df[args.site_col].astype(str).values
+    sites_series = pd.Series(sites_raw)
+    counts = sites_series.value_counts()
+    rare = [lab for lab, cnt in counts.items() if cnt < args.min_per_site and lab != ref_label]
+
+    action = "ignore"
+    if args.cv_handle_rare == "drop" and rare:
+        keep_mask = ~sites_series.isin(rare)
+        X = X.loc[keep_mask].reset_index(drop=True)
+        C_df = C_df.loc[keep_mask].reset_index(drop=True)
+        cv_sites = sites_series[keep_mask].astype(str).values
+        action = f"drop {sorted(rare)}"
+    elif args.cv_handle_rare == "merge" and rare:
+        sites_series.loc[sites_series.isin(rare)] = "OTHER"
+        cv_sites = sites_series.astype(str).values
+        action = f"merge {sorted(rare)} -> OTHER"
+    else:
+        cv_sites = sites_series.astype(str).values
+
+    print(f"[debug] subjects: {len(C_df)} | unique sites: {C_df[args.site_col].nunique()} | "
+          f"ref='{ref_label}' count: {int((C_df[args.site_col]==ref_label).sum()) if ref_label else 0} | "
+          f"rare-handling: {action}", flush=True)
+
+    # ---------------- Build CV splitter (ensure ref in each test fold) ---- #
+    banner("CV SPLIT")
+    n_splits = int(args.folds)
+    if ref_label is not None:
+        ref_n = int(pd.Series(cv_sites).value_counts().get(ref_label, 0))
+        n_splits = min(n_splits, ref_n)  # each test fold needs ≥1 ref sample
+    if n_splits < 2:
+        print(f"[error] Not enough '{ref_label}' samples for CV (need ≥2).", flush=True)
+        sys.exit(3)
+    if n_splits != args.folds:
+        print(f"[warn] Reducing folds from {args.folds} to {n_splits} so every test fold has ≥1 '{ref_label}' sample.",
+              flush=True)
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    per_fold: List[dict] = []
+    fold_iter = skf.split(X.values, cv_sites)
+    pbar = tqdm(total=n_splits, desc="CV folds", ncols=90) if (progress and tqdm is not None) else None
+
+    executed = 0
+    for fold, (tr_idx, te_idx) in enumerate(fold_iter, start=1):
+        if pbar is None:
+            print(f"[{fold}/{n_splits}] start", flush=True)
+
+        Xtr = X.iloc[tr_idx].values.astype(np.float32)
+        Xte = X.iloc[te_idx].values.astype(np.float32)
+
+        cov_tr = C_df.iloc[tr_idx].copy()
+        cov_te = C_df.iloc[te_idx].copy()
+
+        # Skip fold if test set lacks the reference batch
+        if ref_label is not None:
+            te_has_ref = (cov_te[args.site_col].astype(str) == ref_label).any()
+            if not te_has_ref:
+                if pbar is None:
+                    print(f"[{fold}/{n_splits}] skip: no '{ref_label}' in TEST", flush=True)
+                else:
+                    pbar.set_postfix_str("skip: no ref in test"); pbar.update(1)
+                continue
+
+        # Pre-harmonization AUC
+        if pbar is not None: pbar.set_postfix_str("AUC pre")
+        pre_auc = site_auc_on_test(Xtr, cv_sites[tr_idx], Xte, cv_sites[te_idx])
+
+        # Harmonization covariates: batch + AGE (exclude SEX to avoid numeric-cast)
+        cov_tr0 = cov_tr.copy(); cov_te0 = cov_te.copy()
+        cov_tr0[args.site_col] = cov_tr0[args.site_col].astype(str)
+        cov_te0[args.site_col] = cov_te0[args.site_col].astype(str)
+        keep_cols = [args.site_col]
+        if args.age_col in cov_tr0.columns:
+            keep_cols.append(args.age_col)
+        cov_tr_use = cov_tr0[keep_cols].copy()
+        cov_te_use = cov_te0[keep_cols].copy()
+        if args.age_col in cov_tr_use.columns:
+            cov_tr_use[args.age_col] = pd.to_numeric(cov_tr_use[args.age_col], errors="coerce")
+            cov_te_use[args.age_col] = pd.to_numeric(cov_te_use[args.age_col], errors="coerce")
+            if cov_tr_use[args.age_col].isna().any() or cov_te_use[args.age_col].isna().any():
+                print("[error] Non-numeric AGE encountered after split; check covariates.", flush=True)
+                sys.exit(4)
+
+        # Harmonization (new API, else legacy fallback)
+        def _fit_apply(Xtr_arr, cov_tr_df, Xte_arr, cov_te_df, smooth_terms, site_col, ref_label_):
+            try:
+                model, Xtr_adj_ = harmonizationLearn(
+                    Xtr_arr, cov_tr_df, smooth_terms=smooth_terms,
+                    batch_col=site_col, ref_batch=ref_label_
+                )
+                Xte_adj_ = harmonizationApply(Xte_arr, cov_te_df, model)
+                return Xtr_adj_, Xte_adj_
+            except TypeError as e:
+                if "batch_col" not in str(e):
+                    raise
+            cov_tr_old = cov_tr_df.rename(columns={site_col: "SITE"})
+            cov_te_old = cov_te_df.rename(columns={site_col: "SITE"})
+            model, Xtr_adj_ = harmonizationLearn(
+                Xtr_arr, cov_tr_old, smooth_terms=smooth_terms, ref_batch=ref_label_
+            )
+            Xte_adj_ = harmonizationApply(Xte_arr, cov_te_old, model)
+            return Xtr_adj_, Xte_adj_
+
+        if pbar is not None: pbar.set_postfix_str("harmonizing")
+        smooth_terms = [args.age_col] if (args.mode == "gam" and args.age_col in cov_tr_use.columns) else []
+        Xtr_adj, Xte_adj = _fit_apply(
+            Xtr, cov_tr_use, Xte, cov_te_use,
+            smooth_terms=smooth_terms, site_col=args.site_col, ref_label_=ref_label
+        )
+
+        if pbar is not None: pbar.set_postfix_str("AUC post")
+        post_auc = site_auc_on_test(Xtr_adj, cv_sites[tr_idx], Xte_adj, cv_sites[te_idx])
+
+        per_fold.append({
+            "fold": fold,
+            "n_train": int(len(tr_idx)),
+            "n_test": int(len(te_idx)),
+            "pre_auc": float(pre_auc) if pre_auc == pre_auc else None,
+            "post_auc": float(post_auc) if post_auc == post_auc else None,
+        })
+        executed += 1
+
+        if pbar is not None:
+            pbar.update(1)
+        else:
+            print(f"[{fold}/{n_splits}] done: pre_auc={per_fold[-1]['pre_auc']}, "
+                  f"post_auc={per_fold[-1]['post_auc']}", flush=True)
+
+    if tqdm is not None and pbar is not None:
+        pbar.close()
+
+    banner("RESULTS")
+    res = pd.DataFrame(per_fold)
+    res_path = Path(args.out_dir) / f"{args.prefix}_cv_auc.csv"
+    res.to_csv(res_path, index=False)
+    print(f"Wrote {res_path}", flush=True)
+
+    if executed == 0:
+        print("[error] 0 folds executed. Likely every test fold lacked the reference batch "
+              f"('{ref_label}') or stratification was impossible with current settings.\n"
+              "Try: --folds 3  OR  use --site-col/BATCH consistent with --ref-batch  OR  "
+              "--cv-handle-rare merge --min-per-site <larger>.", flush=True)
+        sys.exit(5)
+
+    pre_mean = np.nanmean(res["pre_auc"].values.astype(float)) if len(res) else float("nan")
+    post_mean = np.nanmean(res["post_auc"].values.astype(float)) if len(res) else float("nan")
+    print(f"Mean AUC: pre={pre_mean:.4f} post={post_mean:.4f}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
