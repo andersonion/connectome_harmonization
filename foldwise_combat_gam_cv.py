@@ -143,30 +143,30 @@ def site_auc_on_test(Xtr, ytr, Xte, yte) -> float:
     ytr_enc = le.fit_transform(np.asarray(ytr))
     yte_enc = le.transform(np.asarray(yte))
 
-    # If the test fold has <2 classes, AUC is undefined.
     te_classes = np.unique(yte_enc)
     if len(te_classes) < 2:
         return float("nan")
 
     clf = LogisticRegression(max_iter=2000, multi_class="auto")
     clf.fit(Xtr, ytr_enc)
-    prob = clf.predict_proba(Xte)  # shape: (n_samples, n_train_classes)
+
+    prob_full = clf.predict_proba(Xte)  # shape: (n_samples, n_train_classes)
 
     if len(le.classes_) == 2:
-        # Binary: pass positive class prob
-        return float(roc_auc_score(yte_enc, prob[:, 1]))
+        # binary: column 1 is the positive class
+        return float(roc_auc_score(yte_enc, prob_full[:, 1]))
     else:
-        # Multiclass: tell sklearn exactly which class columns to use
-        # so it can subset prob's columns to the classes present in y_test
-        return float(
-            roc_auc_score(
-                yte_enc,
-                prob,                       # full matrix is fine
-                multi_class="ovr",
-                average="macro",
-                labels=te_classes          # <- key: match y_score columns to y_true classes
-            )
-        )
+        # multiclass: subset prob columns to the classes present in y_test
+        # (te_classes are encoded indices matching columns of predict_proba)
+        prob_sub = prob_full[:, te_classes]
+        return float(roc_auc_score(
+            yte_enc,
+            prob_sub,
+            multi_class="ovr",
+            average="macro",
+            labels=te_classes
+        ))
+
 
 # ------------------------------ Main ----------------------------------- #
 
