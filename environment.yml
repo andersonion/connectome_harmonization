@@ -7,7 +7,9 @@ dependencies:
   - pandas=2.2.*
   - scikit-learn=1.4.*
   - matplotlib=3.8.*
-  - patsy=0.5.*
+  - statsmodels>=0.13
+  - patsy
+  - nibabel
   - pip
   - pip:
       - neuroHarmonize
