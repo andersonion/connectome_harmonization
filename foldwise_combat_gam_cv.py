@@ -2,17 +2,29 @@
 # -*- coding: utf-8 -*-
 
 """
-Fold-wise ComBat / ComBat-GAM CV with optional anchoring to a reference batch.
+Fold-wise ComBat / ComBat-GAM CV with optional anchoring to a reference batch,
+now with progress bars (uses tqdm if installed, else simple prints).
 
-Supports:
-- Numeric features table (rows=subjects, cols=edges)
-- MANIFEST (subject_id,__id__,filepath) with auto-vectorization (upper triangle by default)
+Examples:
 
-Key behavior:
-- Keeps harmonization labels intact; only adjusts CV labels if you ask (merge/drop rares)
-- Multiclass AUC uses predict_proba and matches columns to test classes
-- neuroHarmonize API compatible (new: batch_col=..., old: needs column literally 'SITE')
-- Only passes necessary covariates to harmonization to avoid dtype issues
+# Numeric features (rows=subjects, cols=edges), batches in SITE (ADDecode=1):
+python foldwise_combat_gam_cv.py \
+  --features /path/features_numeric.csv \
+  --covars   /path/covars_all.csv \
+  --site-col SITE --age-col AGE --id-col subject_id \
+  --folds 5 --mode gam \
+  --ref-batch 1 \
+  --out-dir harmonized_cv --prefix ADDECODE_ADNI_HABS
+
+# MANIFEST (subject_id,__id__,filepath) – auto-vectorize (upper triangle):
+python foldwise_combat_gam_cv.py \
+  --features /path/features_manifest.csv \
+  --covars   /path/covars_all.csv \
+  --site-col BATCH --age-col AGE --id-col subject_id \
+  --folds 5 --mode gam \
+  --ref-batch ADDecode:1 \
+  --vectorize upper \
+  --out-dir harmonized_cv --prefix ADDECODE_ADNI_HABS
 """
 
 from __future__ import annotations
@@ -30,7 +42,14 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
-from neuroHarmonize import harmonizationLearn, harmonizationApply  # import early to fail fast if deps missing
+# Fail fast if deps missing
+from neuroHarmonize import harmonizationLearn, harmonizationApply
+
+# Optional pretty progress
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
 
 # ----------------------------- Logging -------------------------------- #
@@ -38,6 +57,13 @@ from neuroHarmonize import harmonizationLearn, harmonizationApply  # import earl
 def setup_logging(verbosity: int) -> None:
     level = logging.WARNING if verbosity <= 0 else logging.INFO if verbosity == 1 else logging.DEBUG
     logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+
+
+def iter_progress(iterable, total=None, desc="", enable=True):
+    """Yield iterable with tqdm if available & enabled; else plain iterable."""
+    if enable and tqdm is not None:
+        return tqdm(iterable, total=total, desc=desc, ncols=90)
+    return iterable
 
 
 # ------------------------- Feature Loading ----------------------------- #
@@ -64,11 +90,15 @@ def _vectorize_array(A: np.ndarray, mode: str) -> np.ndarray:
     return A.ravel()
 
 
-def build_numeric_from_manifest(manifest_df: pd.DataFrame, id_col: str, mode: str = "upper") -> pd.DataFrame:
+def build_numeric_from_manifest(manifest_df: pd.DataFrame, id_col: str, mode: str = "upper",
+                                progress: bool = True) -> pd.DataFrame:
     rows, ids = [], []
     first_len = None
-    for _, rec in manifest_df.iterrows():
-        fp = rec["filepath"]
+    it = iter_progress(manifest_df.itertuples(index=False), total=len(manifest_df),
+                       desc="Vectorizing subjects", enable=progress)
+    for rec in it:
+        fp = getattr(rec, "filepath")
+        sid = getattr(rec, id_col)
         A = _read_numeric_file(fp)
         v = _vectorize_array(A, mode)
         if first_len is None:
@@ -76,21 +106,21 @@ def build_numeric_from_manifest(manifest_df: pd.DataFrame, id_col: str, mode: st
         elif v.size != first_len:
             raise SystemExit(f"Feature length mismatch at {fp}: {v.size} vs {first_len}")
         rows.append(v.astype(np.float32))
-        ids.append(str(rec[id_col]))
+        ids.append(str(sid))
     cols = [f"e{i:06d}" for i in range(first_len)]
     X = pd.DataFrame(rows, columns=cols)
     X.insert(0, id_col, ids)
     return X
 
 
-def read_numeric_or_manifest(features_path: Path, id_col: str, vectorize: str) -> pd.DataFrame:
+def read_numeric_or_manifest(features_path: Path, id_col: str, vectorize: str, progress: bool) -> pd.DataFrame:
     df = pd.read_csv(features_path)
     if "filepath" in df.columns:
         logging.info("Detected MANIFEST (has 'filepath'); vectorizing per-subject files (mode=%s).", vectorize)
         need = {id_col, "filepath"}
         if not need.issubset(df.columns):
             raise SystemExit(f"Manifest must contain columns {need}. Found: {list(df.columns)}")
-        return build_numeric_from_manifest(df[[id_col, "filepath"]].copy(), id_col=id_col, mode=vectorize)
+        return build_numeric_from_manifest(df[[id_col, "filepath"]].copy(), id_col=id_col, mode=vectorize, progress=progress)
 
     if id_col not in df.columns:
         raise SystemExit(f"Features table missing id-col '{id_col}'. Columns: {list(df.columns)[:10]}")
@@ -134,7 +164,7 @@ def site_auc_on_test(Xtr: np.ndarray, ytr, Xte: np.ndarray, yte) -> float:
     if len(le.classes_) == 2:
         return float(roc_auc_score(yte_enc, prob_full[:, 1]))
     else:
-        # subset prob columns to classes present in test (encoded indices)
+        # subset prob columns to the classes present in test (encoded indices)
         prob_sub = prob_full[:, te_classes]
         return float(roc_auc_score(yte_enc, prob_sub, multi_class="ovr", average="macro"))
 
@@ -164,10 +194,12 @@ def main():
     ap.add_argument("--min-per-site", type=int, default=2, help="Sites with < this many samples are 'rare'.")
     ap.add_argument("--out-dir", required=True, help="Output directory for per-fold results.")
     ap.add_argument("--prefix", required=True, help="Prefix for outputs.")
+    ap.add_argument("--no-progress", action="store_true", help="Disable progress bars/logging steps.")
     ap.add_argument("-v", "--verbose", action="count", default=1, help="Increase verbosity (-v, -vv).")
 
     args = ap.parse_args()
     setup_logging(args.verbose)
+    progress = not args.no_progress
 
     features_path = Path(args.features)
     covars_path = Path(args.covars)
@@ -175,7 +207,7 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
 
     # Load inputs
-    X_df = read_numeric_or_manifest(features_path, id_col=args.id_col, vectorize=args.vectorize)
+    X_df = read_numeric_or_manifest(features_path, id_col=args.id_col, vectorize=args.vectorize, progress=progress)
     C_df = pd.read_csv(covars_path)
 
     # Optional age filter
@@ -246,58 +278,83 @@ def main():
     else:
         cv_sites = sites_series.astype(str).values
 
+    # ---------------- Build CV splitter (ensure ref in each test fold) ---- #
+    n_splits = int(args.folds)
     if ref_label is not None:
-        ref_n = int(np.sum(cv_sites == ref_label))
-        if ref_n < args.folds:
-            logging.warning("Reference batch '%s' has only %d sample(s); "
-                            "StratifiedKFold(n_splits=%d) may warn/fail.",
-                            ref_label, ref_n, args.folds)
+        ref_n = int(pd.Series(cv_sites).value_counts().get(ref_label, 0))
+        n_splits = min(n_splits, ref_n)  # each test fold needs ≥1 ref sample
+    if n_splits < 2:
+        raise SystemExit(
+            f"Not enough '{ref_label}' samples for CV: have {pd.Series(cv_sites).value_counts().get(ref_label,0)}, "
+            f"need at least 2 to make ≥2 folds. Reduce --folds or add data."
+        )
+    if n_splits != args.folds:
+        print(f"[warn] Reducing folds from {args.folds} to {n_splits} so every test fold has "
+              f"at least one '{ref_label}' sample.")
 
-    # ---------------- Build CV splitter ---------------- #
-    skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
     per_fold: List[dict] = []
-    for fold, (tr_idx, te_idx) in enumerate(skf.split(X.values, cv_sites), start=1):
+    fold_iter = skf.split(X.values, cv_sites)
+    # Progress over folds
+    pbar = tqdm(total=n_splits, desc="CV folds", ncols=90) if (progress and tqdm is not None) else None
+
+    for fold, (tr_idx, te_idx) in enumerate(fold_iter, start=1):
+        if pbar is None:
+            print(f"[{fold}/{n_splits}] starting fold...", flush=True)
+
         Xtr = X.iloc[tr_idx].values.astype(np.float32)
         Xte = X.iloc[te_idx].values.astype(np.float32)
 
         cov_tr = C_df.iloc[tr_idx].copy()
         cov_te = C_df.iloc[te_idx].copy()
 
+        # Skip fold if test set lacks the reference batch (belt & suspenders)
+        if ref_label is not None:
+            te_has_ref = (cov_te[args.site_col].astype(str) == ref_label).any()
+            if not te_has_ref:
+                if pbar is None:
+                    print(f"[{fold}/{n_splits}] no '{ref_label}' in TEST; skipping.", flush=True)
+                else:
+                    pbar.set_postfix_str("skip: no ref in test")
+                    pbar.update(1)
+                continue
+
         # Pre-harmonization AUC (site predictability)
+        if pbar is not None:
+            pbar.set_postfix_str("AUC pre")
         pre_auc = site_auc_on_test(Xtr, cv_sites[tr_idx], Xte, cv_sites[te_idx])
 
         # --------------- Harmonization (fit on train, apply to test) --------------- #
+        if pbar is not None:
+            pbar.set_postfix_str("harmonizing")
+
         cov_tr0 = cov_tr.copy()
         cov_te0 = cov_te.copy()
         cov_tr0[args.site_col] = cov_tr0[args.site_col].astype(str)
         cov_te0[args.site_col] = cov_te0[args.site_col].astype(str)
-        
-        # Keep only batch + AGE (exclude SEX to avoid numeric-cast error)
+
+        # Keep only the needed covariates for harmonization: batch + AGE (exclude SEX to avoid numeric-cast)
         keep_cols = [args.site_col]
         if args.age_col in cov_tr0.columns:
             keep_cols.append(args.age_col)
-        
         cov_tr_use = cov_tr0[keep_cols].copy()
         cov_te_use = cov_te0[keep_cols].copy()
-
-
-        # Ensure AGE numeric (again, on the split)
         if args.age_col in cov_tr_use.columns:
             cov_tr_use[args.age_col] = pd.to_numeric(cov_tr_use[args.age_col], errors="coerce")
             cov_te_use[args.age_col] = pd.to_numeric(cov_te_use[args.age_col], errors="coerce")
             if cov_tr_use[args.age_col].isna().any() or cov_te_use[args.age_col].isna().any():
                 raise SystemExit("Non-numeric AGE encountered after split; check covariates.")
 
-        def _fit_apply(Xtr_arr, cov_tr_df, Xte_arr, cov_te_df, smooth_terms, site_col, ref_label):
-            # Try NEW API (supports batch_col)
+        def _fit_apply(Xtr_arr, cov_tr_df, Xte_arr, cov_te_df, smooth_terms, site_col, ref_label_):
+            # Try NEW API (supports batch_col=...)
             try:
                 model, Xtr_adj_ = harmonizationLearn(
                     Xtr_arr,
                     cov_tr_df,
                     smooth_terms=smooth_terms,
                     batch_col=site_col,
-                    ref_batch=ref_label
+                    ref_batch=ref_label_
                 )
                 Xte_adj_ = harmonizationApply(Xte_arr, cov_te_df, model)
                 return Xtr_adj_, Xte_adj_
@@ -305,52 +362,4 @@ def main():
                 if "batch_col" not in str(e):
                     raise  # some other error; surface it
 
-            # OLD API fallback: rename batch column to literal 'SITE'
-            cov_tr_old = cov_tr_df.rename(columns={site_col: "SITE"})
-            cov_te_old = cov_te_df.rename(columns={site_col: "SITE"})
-            model, Xtr_adj_ = harmonizationLearn(
-                Xtr_arr,
-                cov_tr_old,
-                smooth_terms=smooth_terms,
-                ref_batch=ref_label
-            )
-            Xte_adj_ = harmonizationApply(Xte_arr, cov_te_old, model)
-            return Xtr_adj_, Xte_adj_
-
-        smooth_terms = [args.age_col] if (args.mode == "gam" and args.age_col in cov_tr_use.columns) else []
-        Xtr_adj, Xte_adj = _fit_apply(
-            Xtr, cov_tr_use,
-            Xte, cov_te_use,
-            smooth_terms=smooth_terms,
-            site_col=args.site_col,
-            ref_label=ref_label
-        )
-
-        # Post-harmonization AUC
-        post_auc = site_auc_on_test(Xtr_adj, cv_sites[tr_idx], Xte_adj, cv_sites[te_idx])
-
-        per_fold.append({
-            "fold": fold,
-            "n_train": int(len(tr_idx)),
-            "n_test": int(len(te_idx)),
-            "pre_auc": float(pre_auc) if pre_auc == pre_auc else None,
-            "post_auc": float(post_auc) if post_auc == post_auc else None,
-        })
-        logging.info("Fold %d: pre_auc=%s, post_auc=%s",
-                     fold,
-                     f"{per_fold[-1]['pre_auc']:.4f}" if per_fold[-1]['pre_auc'] is not None else "nan",
-                     f"{per_fold[-1]['post_auc']:.4f}" if per_fold[-1]['post_auc'] is not None else "nan")
-
-    # ---------------- Save results ---------------- #
-    res = pd.DataFrame(per_fold)
-    res_path = Path(args.out_dir) / f"{args.prefix}_cv_auc.csv"
-    res.to_csv(res_path, index=False)
-    print(f"Wrote {res_path}")
-
-    pre_mean = np.nanmean(res["pre_auc"].values.astype(float))
-    post_mean = np.nanmean(res["post_auc"].values.astype(float))
-    print(f"Mean AUC: pre={pre_mean:.4f} post={post_mean:.4f}")
-
-
-if __name__ == "__main__":
-    main()
+            # OLD API fallback: rename bat
