@@ -106,6 +106,50 @@ def read_csv_safely(path: Path) -> pd.DataFrame:
         return pd.read_csv(StringIO(text), engine="python")
 
 
+def _read_numeric(fp: str) -> np.ndarray:
+    """Read a per-subject file as a numeric array. Tries CSV then TSV."""
+    import pandas as pd
+    try:
+        return pd.read_csv(fp, header=None).values
+    except Exception:
+        return pd.read_csv(fp, sep="\t", header=None).values
+
+def _vectorize_array(A: np.ndarray, mode: str) -> np.ndarray:
+    A = np.asarray(A, float)
+    if mode == "flatten" or A.ndim == 1 or 1 in A.shape:
+        return A.ravel()
+    # assume square adjacency and take upper triangle without diagonal
+    if A.ndim == 2 and A.shape[0] == A.shape[1]:
+        r, c = np.triu_indices_from(A, k=1)
+        return A[r, c]
+    # fallback: flatten
+    return A.ravel()
+
+def build_numeric_from_manifest(manifest_df, mode: str = "upper"):
+    """
+    manifest_df columns: ['subject_id', '__id__', 'filepath'] (aligned subset).
+    Returns a pandas DataFrame with 'subject_id' + numeric feature columns.
+    """
+    import pandas as pd
+    rows, ids = [], []
+    first_len = None
+    for _, rec in manifest_df.iterrows():
+        fp = rec["filepath"]
+        A = _read_numeric(fp)
+        v = _vectorize_array(A, mode)
+        if first_len is None:
+            first_len = v.size
+        elif v.size != first_len:
+            raise SystemExit(f"Feature length mismatch for {fp}: {v.size} vs {first_len}")
+        rows.append(v.astype(np.float32))
+        ids.append(str(rec["subject_id"]))
+    cols = [f"e{i:06d}" for i in range(first_len)]
+    import pandas as pd
+    X = pd.DataFrame(rows, columns=cols)
+    X.insert(0, "subject_id", ids)
+    return X
+
+
 # ------------------------------- Loaders ------------------------------------ #
 
 def load_clean_covars(
@@ -263,6 +307,13 @@ def main(argv: List[str] | None = None) -> int:
     ap.add_argument("--id-col", default="subject_id", help="ID column name in tables (default: subject_id).")
     ap.add_argument("--site-col", default="SITE", help="Site column name in covars (default: SITE).")
     ap.add_argument("--age-col", default="AGE", help="Age column name in covars (default: AGE).")
+    ap.add_argument(
+    "--vectorize",
+    choices=["none", "upper", "flatten"],
+    default="none",
+    help="When --connectomes is a DIRECTORY, emit a numeric features table by "
+         "vectorizing each per-subject file: 'upper' = upper triangle (no diag), "
+         "'flatten' = full flatten. Default: none (manifest only).")
 
     # NEW robustness flags
     ap.add_argument(
@@ -319,10 +370,19 @@ def main(argv: List[str] | None = None) -> int:
     logging.info("Wrote %s (%d rows)", cov_out, len(cov2))
 
     if is_dir:
-        # For directories, write a manifest of the matched files
         man_out = outdir / "features_manifest_aligned.csv"
-        feats2[["subject_id", "__id__", "filepath"]].to_csv(man_out, index=False)
-        logging.info("Wrote %s (%d rows)", man_out, len(feats2))
+        manifest_aligned = feats2[["subject_id", "__id__", "filepath"]].copy()
+        manifest_aligned.to_csv(man_out, index=False)
+        logging.info("Wrote %s (%d rows)", man_out, len(manifest_aligned))
+    
+        # NEW: also emit numeric features if requested
+        if args.vectorize != "none":
+            logging.info("Vectorizing per-subject files with mode='%s' ...", args.vectorize)
+            Xnum = build_numeric_from_manifest(manifest_aligned, mode=args.vectorize)
+            num_out = outdir / "features_numeric_aligned.csv"
+            Xnum.to_csv(num_out, index=False)
+            logging.info("Wrote %s (%d subjects × %d features)", num_out, Xnum.shape[0], Xnum.shape[1]-1)
+
     else:
         # For tables, write the aligned table
         feats_out = outdir / "features_aligned.csv"

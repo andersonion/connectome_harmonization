@@ -76,21 +76,34 @@ def pca_scatter(X, sites, title, save_path):
     plt.savefig(save_path, dpi=150)
     plt.close()
 
-def site_auc_on_test(X_train, y_train, X_test, y_test):
-    # Project to 10 PCs, train LR on train, evaluate AUC on test (multi-class OVR)
-    pca = PCA(n_components=min(10, X_train.shape[1]), random_state=42)
-    Ztr = pca.fit_transform(X_train)
-    Zte = pca.transform(X_test)
-    clf = LogisticRegression(max_iter=500, multi_class='ovr')
-    clf.fit(Ztr, y_train)
-    # If binary, use decision_function; if multi-class, macro-average OVR AUC
-    if len(np.unique(y_test)) == 2:
-        scores = clf.decision_function(Zte)
-        auc = roc_auc_score(y_test, scores)
+def site_auc_on_test(Xtr, ytr, Xte, yte):
+    import numpy as np
+    from sklearn.preprocessing import LabelEncoder
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import roc_auc_score
+
+    # Encode labels to 0..K-1
+    le = LabelEncoder()
+    ytr_enc = le.fit_transform(ytr)
+    yte_enc = le.transform(yte)
+
+    # If test fold has <2 classes, AUC is undefined; skip this fold
+    if len(np.unique(yte_enc)) < 2:
+        return np.nan
+
+    # Use a classifier that **supports predict_proba**
+    clf = LogisticRegression(max_iter=2000, multi_class="auto")
+    clf.fit(Xtr, ytr_enc)
+
+    if len(le.classes_) == 2:
+        # Binary: pass the positive-class probability
+        prob = clf.predict_proba(Xte)[:, 1]
+        return float(roc_auc_score(yte_enc, prob))
     else:
-        scores = clf.decision_function(Zte)
-        auc = roc_auc_score(y_test, scores, multi_class='ovr')
-    return auc
+        # Multiclass: pass full probability matrix (rows sum to 1)
+        prob = clf.predict_proba(Xte)  # shape (n_samples, n_classes)
+        return float(roc_auc_score(yte_enc, prob, multi_class="ovr", average="macro"))
+
 
 def encode_covars(covars, site_col, age_col):
     cov = covars.copy()
