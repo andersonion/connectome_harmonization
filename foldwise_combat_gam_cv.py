@@ -129,30 +129,44 @@ def build_numeric_from_manifest(manifest_df: pd.DataFrame, id_col: str, mode: st
 
 # ------------------------------ Metrics -------------------------------- #
 
-def site_auc_on_test(Xtr: np.ndarray, ytr, Xte: np.ndarray, yte) -> float:
+def site_auc_on_test(Xtr, ytr, Xte, yte) -> float:
     """
-    AUC of a site classifier trained on train fold and evaluated on test fold.
-    Uses predict_proba; returns np.nan if the test fold has <2 classes.
+    Train a site classifier on (Xtr,ytr) and compute ROC-AUC on (Xte,yte).
+    Uses predict_proba. Returns NaN if the test fold has <2 classes.
     """
-    ytr = np.asarray(ytr)
-    yte = np.asarray(yte)
+    import numpy as np
+    from sklearn.preprocessing import LabelEncoder
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import roc_auc_score
 
     le = LabelEncoder()
-    ytr_enc = le.fit_transform(ytr)
-    yte_enc = le.transform(yte)
+    ytr_enc = le.fit_transform(np.asarray(ytr))
+    yte_enc = le.transform(np.asarray(yte))
 
-    if len(np.unique(yte_enc)) < 2:
+    # If the test fold has <2 classes, AUC is undefined.
+    te_classes = np.unique(yte_enc)
+    if len(te_classes) < 2:
         return float("nan")
 
     clf = LogisticRegression(max_iter=2000, multi_class="auto")
     clf.fit(Xtr, ytr_enc)
-    if len(le.classes_) == 2:
-        prob = clf.predict_proba(Xte)[:, 1]
-        return float(roc_auc_score(yte_enc, prob))
-    else:
-        prob = clf.predict_proba(Xte)
-        return float(roc_auc_score(yte_enc, prob, multi_class="ovr", average="macro"))
+    prob = clf.predict_proba(Xte)  # shape: (n_samples, n_train_classes)
 
+    if len(le.classes_) == 2:
+        # Binary: pass positive class prob
+        return float(roc_auc_score(yte_enc, prob[:, 1]))
+    else:
+        # Multiclass: tell sklearn exactly which class columns to use
+        # so it can subset prob's columns to the classes present in y_test
+        return float(
+            roc_auc_score(
+                yte_enc,
+                prob,                       # full matrix is fine
+                multi_class="ovr",
+                average="macro",
+                labels=te_classes          # <- key: match y_score columns to y_true classes
+            )
+        )
 
 # ------------------------------ Main ----------------------------------- #
 
