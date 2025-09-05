@@ -287,3 +287,39 @@ def main():
         else:
             # "anchored" = no spline term; still allow anchoring to ref_batch
             model, Xtr_adj = harmonizationLearn(
+                Xtr,
+                cov_tr,
+                smooth_terms=[],               # no spline(age)
+                batch_col=args.site_col,
+                ref_batch=ref_label
+            )
+            Xte_adj = harmonizationApply(Xte, cov_te, model)
+
+        # Post-harmonization AUC
+        post_auc = site_auc_on_test(Xtr_adj, cv_sites[tr_idx], Xte_adj, cv_sites[te_idx])
+
+        per_fold.append({
+            "fold": fold,
+            "n_train": int(len(tr_idx)),
+            "n_test": int(len(te_idx)),
+            "pre_auc": float(pre_auc) if pre_auc == pre_auc else None,
+            "post_auc": float(post_auc) if post_auc == post_auc else None,
+        })
+        logging.info("Fold %d: pre_auc=%.4f, post_auc=%.4f", fold,
+                     per_fold[-1]["pre_auc"] or float("nan"),
+                     per_fold[-1]["post_auc"] or float("nan"))
+
+    # ---------------- Save results ---------------- #
+    res = pd.DataFrame(per_fold)
+    res_path = outdir / f"{args.prefix}_cv_auc.csv"
+    res.to_csv(res_path, index=False)
+    print(f"Wrote {res_path}")
+
+    # Summary
+    pre_mean = np.nanmean(res["pre_auc"].values.astype(float))
+    post_mean = np.nanmean(res["post_auc"].values.astype(float))
+    print(f"Mean AUC: pre={pre_mean:.4f} post={post_mean:.4f}")
+
+
+if __name__ == "__main__":
+    main()
