@@ -40,6 +40,40 @@ except Exception:
     tqdm = None
 
 
+def augment_test_for_missing_train_levels(cov_te_df: pd.DataFrame,
+                                          Xte_arr: np.ndarray,
+                                          site_col: str,
+                                          missing_levels: list[str],
+                                          age_col: str | None = None,
+                                          age_fill: float | None = None):
+    """
+    Ensure test covars contain at least one row for every training batch level.
+    Appends 1 dummy row per missing level (with age filled), and duplicates a
+    baseline feature row so shapes match. Returns (cov_te_aug, Xte_aug, n_added).
+    """
+    if not missing_levels:
+        return cov_te_df, Xte_arr, 0
+
+    rows = []
+    for lvl in missing_levels:
+        row = {site_col: str(lvl)}
+        if age_col and age_col in cov_te_df.columns:
+            row[age_col] = age_fill if age_fill is not None else float(np.nanmedian(cov_te_df[age_col].values))
+        rows.append(row)
+
+    add_df = pd.DataFrame(rows)
+    cov_te_aug = pd.concat([cov_te_df, add_df], ignore_index=True)
+
+    n_added = len(missing_levels)
+    n_feat = Xte_arr.shape[1]
+    base = Xte_arr[0:1] if Xte_arr.shape[0] else np.zeros((1, n_feat), dtype=np.float32)
+    add_X = np.repeat(base, n_added, axis=0)
+    Xte_aug = np.vstack([Xte_arr, add_X]).astype(np.float32)
+    return cov_te_aug, Xte_aug, n_added
+
+
+
+
 # ----------------------------- Logging -------------------------------- #
 
 def setup_logging(verbosity: int) -> None:
@@ -354,11 +388,39 @@ def main():
             return Xtr_adj_, Xte_adj_
 
         if pbar is not None: pbar.set_postfix_str("harmonizing")
-        smooth_terms = [args.age_col] if (args.mode == "gam" and args.age_col in cov_tr_use.columns) else []
-        Xtr_adj, Xte_adj = _fit_apply(
-            Xtr, cov_tr_use, Xte, cov_te_use,
-            smooth_terms=smooth_terms, site_col=args.site_col, ref_label_=ref_label
+        
+        # Determine training batch levels and missing ones in TEST
+        train_levels = sorted(cov_tr_use[args.site_col].astype(str).unique().tolist())
+        test_levels = set(cov_te_use[args.site_col].astype(str))
+        missing_levels = [lvl for lvl in train_levels if lvl not in test_levels]
+        
+        # Fill value for AGE (if present)
+        age_fill = None
+        if args.age_col in cov_tr_use.columns:
+            age_fill = float(np.nanmedian(cov_tr_use[args.age_col].values))
+        
+        # Augment TEST covars/features to include all training levels
+        cov_te_aug, Xte_aug, n_added = augment_test_for_missing_train_levels(
+            cov_te_use, Xte, args.site_col, missing_levels,
+            age_col=(args.age_col if args.age_col in cov_tr_use.columns else None),
+            age_fill=age_fill
         )
+        if n_added:
+            print(f"[info] Fold {fold}: added {n_added} dummy row(s) to TEST for missing batches: {missing_levels}", flush=True)
+        
+        # Fit/apply (with possibly augmented TEST)
+        smooth_terms = [args.age_col] if (args.mode == "gam" and args.age_col in cov_tr_use.columns) else []
+        Xtr_adj, Xte_adj_full = _fit_apply(
+            Xtr, cov_tr_use,
+            Xte_aug, cov_te_aug,
+            smooth_terms=smooth_terms,
+            site_col=args.site_col,
+            ref_label_=ref_label
+        )
+        
+        # Drop dummy rows from adjusted TEST
+        Xte_adj = Xte_adj_full[:Xte.shape[0], :]
+
 
         if pbar is not None: pbar.set_postfix_str("AUC post")
         post_auc = site_auc_on_test(Xtr_adj, cv_sites[tr_idx], Xte_adj, cv_sites[te_idx])
