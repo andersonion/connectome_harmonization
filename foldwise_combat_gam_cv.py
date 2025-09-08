@@ -182,7 +182,7 @@ def main():
     args = ap.parse_args()
     setup_logging(args.verbose)
     progress = not args.no_progress
-
+    
     banner("LOAD")
     features_path = Path(args.features)
     covars_path = Path(args.covars)
@@ -209,8 +209,18 @@ def main():
     C_df = C_df.set_index(args.id_col).loc[keep_ids].reset_index()
 
     # Harmonization labels
-    C_df[args.site_col] = C_df[args.site_col].astype(str)
-    ref_label = None if args.ref_batch is None else str(args.ref_batch)
+
+
+    C_df[args.site_col] = C_df[args.site_col].astype(str).str.strip()
+    # If you want case-insensitive matching, uncomment the next two lines and pass an uppercased --ref-batch:
+    C_df[args.site_col] = C_df[args.site_col].str.upper()
+    
+    # Normalize the ref label the same way
+    ref_label = None if args.ref_batch is None else str(args.ref_batch).strip()
+    # If you uppercased SITE above, also do:
+    ref_label = ref_label.upper() if ref_label is not None else None
+
+
     if ref_label is not None and ref_label not in set(C_df[args.site_col].unique()):
         print(f"[error] --ref-batch '{ref_label}' not found in column '{args.site_col}'.", flush=True)
         uniq = C_df[args.site_col].value_counts().head(20)
