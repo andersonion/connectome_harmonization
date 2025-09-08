@@ -2,16 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-Fold-wise ComBat / ComBat-GAM CV with optional anchoring to a reference batch,
-with progress bars and debug banners.
+Fold-wise ComBat / ComBat-GAM CV with optional anchoring to a reference batch.
 
 Key features:
-- Accepts numeric features OR a manifest (auto-vectorizes per-subject files)
-- Keeps harmonization labels intact; CV-only rare-class merging/dropping
-- Uses predict_proba for AUC; handles subset classes in test
-- Compatible with both neuroHarmonize APIs (batch_col or legacy 'SITE')
-- Ensures each test fold has ≥1 ref-batch sample; skips offending folds
-- Emits clear DEBUG stats; exits non-zero if 0 folds executed
+- Accepts numeric features OR a manifest (subject_id + filepath) and auto-vectorizes per-subject matrices
+- Normalizes SITE labels, enforces numeric AGE, excludes SEX from harmonization covariates
+- Compatible with neuroHarmonize new API (batch_col=...) and legacy API (requires 'SITE')
+- Augments test covars with dummy rows for missing training batch levels (prevents ref_level index errors)
+- Stratified CV with auto reduction of folds based on smallest class count
+- Optional pre/post site-prediction AUC (with train-mean imputation, feature subsampling)
+- Optional PCA colored by SITE (pre/post) saved as CSV + PNG per fold
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -29,72 +29,44 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
+from sklearn.decomposition import PCA
 
-# Fail fast if deps missing
+# plotting headless
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# neuroHarmonize
 from neuroHarmonize import harmonizationLearn, harmonizationApply
 
-# Optional pretty progress
+# optional progress
 try:
     from tqdm import tqdm
 except Exception:
     tqdm = None
 
 
-def augment_test_for_missing_train_levels(cov_te_df: pd.DataFrame,
-                                          Xte_arr: np.ndarray,
-                                          site_col: str,
-                                          missing_levels: list[str],
-                                          age_col: str | None = None,
-                                          age_fill: float | None = None):
-    """
-    Ensure test covars contain at least one row for every training batch level.
-    Appends 1 dummy row per missing level (with age filled), and duplicates a
-    baseline feature row so shapes match. Returns (cov_te_aug, Xte_aug, n_added).
-    """
-    if not missing_levels:
-        return cov_te_df, Xte_arr, 0
-
-    rows = []
-    for lvl in missing_levels:
-        row = {site_col: str(lvl)}
-        if age_col and age_col in cov_te_df.columns:
-            row[age_col] = age_fill if age_fill is not None else float(np.nanmedian(cov_te_df[age_col].values))
-        rows.append(row)
-
-    add_df = pd.DataFrame(rows)
-    cov_te_aug = pd.concat([cov_te_df, add_df], ignore_index=True)
-
-    n_added = len(missing_levels)
-    n_feat = Xte_arr.shape[1]
-    base = Xte_arr[0:1] if Xte_arr.shape[0] else np.zeros((1, n_feat), dtype=np.float32)
-    add_X = np.repeat(base, n_added, axis=0)
-    Xte_aug = np.vstack([Xte_arr, add_X]).astype(np.float32)
-    return cov_te_aug, Xte_aug, n_added
-
-
-
-
-# ----------------------------- Logging -------------------------------- #
+# ----------------------------- Logging / UX ----------------------------- #
 
 def setup_logging(verbosity: int) -> None:
     level = logging.WARNING if verbosity <= 0 else logging.INFO if verbosity == 1 else logging.DEBUG
     logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
 
 
+def banner(msg: str):
+    print(f"\n=== {msg} ===", flush=True)
+
+
 def iter_progress(iterable, total=None, desc="", enable=True):
-    """Yield iterable with tqdm if available & enabled; else plain iterable."""
     if enable and tqdm is not None:
         return tqdm(iterable, total=total, desc=desc, ncols=90)
     return iterable
 
 
-def banner(msg: str):
-    print(f"\n=== {msg} ===", flush=True)
-
-
-# ------------------------- Feature Loading ----------------------------- #
+# ------------------------------ I/O helpers ----------------------------- #
 
 def _read_numeric_file(fp: str) -> np.ndarray:
+    # Try CSV then TSV (no header)
     try:
         return pd.read_csv(fp, header=None).values
     except Exception:
@@ -116,8 +88,9 @@ def _vectorize_array(A: np.ndarray, mode: str) -> np.ndarray:
     return A.ravel()
 
 
-def build_numeric_from_manifest(manifest_df: pd.DataFrame, id_col: str, mode: str = "upper",
-                                progress: bool = True) -> pd.DataFrame:
+def build_numeric_from_manifest(
+    manifest_df: pd.DataFrame, id_col: str, mode: str = "upper", progress: bool = True
+) -> pd.DataFrame:
     rows, ids = [], []
     first_len = None
     it = iter_progress(manifest_df.itertuples(index=False), total=len(manifest_df),
@@ -150,7 +123,6 @@ def read_numeric_or_manifest(features_path: Path, id_col: str, vectorize: str, p
 
     if id_col not in df.columns:
         raise SystemExit(f"Features table missing id-col '{id_col}'. Columns: {list(df.columns)[:10]}")
-
     id_series = df[id_col].astype(str)
     num = df.drop(columns=[id_col]).apply(pd.to_numeric, errors="coerce")
     bad = [c for c in num.columns if num[c].isnull().any()]
@@ -164,14 +136,12 @@ def read_numeric_or_manifest(features_path: Path, id_col: str, vectorize: str, p
     return out
 
 
-# ------------------------------ Metrics -------------------------------- #
+# ------------------------------ AUC helpers ----------------------------- #
 
-
-def sanitize_for_auc(Xtr: np.ndarray, Xte: np.ndarray, *, tag: str = ""):
+def sanitize_for_auc(Xtr: np.ndarray, Xte: np.ndarray, *, tag: str = "") -> Tuple[np.ndarray, np.ndarray]:
     """
     Replace NaN/Inf in Xtr/Xte with column means computed on Xtr.
-    Columns that are entirely non-finite in Xtr get mean=0.0.
-    Returns cleaned float32 arrays.
+    Columns entirely non-finite in Xtr get mean=0.0. Returns float32 arrays.
     """
     A_tr = np.asarray(Xtr, dtype=np.float32, order="C").copy()
     A_te = np.asarray(Xte, dtype=np.float32, order="C").copy()
@@ -184,34 +154,107 @@ def sanitize_for_auc(Xtr: np.ndarray, Xte: np.ndarray, *, tag: str = ""):
 
     col_mean = np.where(np.isfinite(col_mean), col_mean, 0.0).astype(np.float32)
 
-    # broadcast per-column means to bad entries
     A_tr = np.where(fin_tr, A_tr, col_mean)
     A_te = np.where(fin_te, A_te, col_mean)
-
-    # optional: tiny jitter if a column becomes constant
-    # (LogReg is usually fine without it; keep simple)
     return A_tr, A_te
 
 
+def subsample_features(Xtr: np.ndarray, Xte: np.ndarray, k: Optional[int], seed: int = 42):
+    if k is None or Xtr.shape[1] <= k:
+        return Xtr, Xte
+    rng = np.random.default_rng(seed)
+    cols = rng.choice(Xtr.shape[1], size=k, replace=False)
+    return Xtr[:, cols], Xte[:, cols]
+
+
 def site_auc_on_test(Xtr: np.ndarray, ytr, Xte: np.ndarray, yte) -> float:
-    """Train site classifier on (Xtr,ytr); ROC-AUC on (Xte,yte)."""
-    ytr = np.asarray(ytr); yte = np.asarray(yte)
+    """
+    Train a site classifier on (Xtr,ytr) and compute ROC-AUC on (Xte,yte).
+    Uses predict_proba. Returns NaN if the test fold has <2 classes.
+    Handles test-time subset of training classes.
+    """
+    ytr = np.asarray(ytr)
+    yte = np.asarray(yte)
+
     le = LabelEncoder()
     ytr_enc = le.fit_transform(ytr)
     yte_enc = le.transform(yte)
+
     te_classes = np.unique(yte_enc)
     if len(te_classes) < 2:
         return float("nan")
+
     clf = LogisticRegression(max_iter=2000, multi_class="auto")
     clf.fit(Xtr, ytr_enc)
-    prob_full = clf.predict_proba(Xte)
+    prob_full = clf.predict_proba(Xte)  # (n_samples, n_train_classes)
+
     if len(le.classes_) == 2:
         return float(roc_auc_score(yte_enc, prob_full[:, 1]))
-    prob_sub = prob_full[:, te_classes]  # subset to test classes
+    prob_sub = prob_full[:, te_classes]  # subset to columns present in test
     return float(roc_auc_score(yte_enc, prob_sub, multi_class="ovr", average="macro"))
 
 
-# ------------------------------ Main ----------------------------------- #
+# ---------------------------- PCA helpers ------------------------------- #
+
+def maybe_subsample_rows(df: pd.DataFrame, n: Optional[int], seed: int = 42):
+    if n is None or len(df) <= n:
+        return df
+    return df.sample(n=n, random_state=seed).reset_index(drop=True)
+
+
+def pca_scatter(df: pd.DataFrame, title: str, out_png: Path):
+    # df columns: PC1, PC2, SITE, split
+    plt.figure(figsize=(6, 5))
+    sites = df["SITE"].astype(str).unique().tolist()
+    many = len(sites) > 12
+    for lab in sites:
+        m = df["SITE"].astype(str) == str(lab)
+        plt.scatter(df.loc[m, "PC1"], df.loc[m, "PC2"], s=10, alpha=0.7, label=str(lab))
+    if not many:
+        plt.legend(markerscale=2, bbox_to_anchor=(1.04, 1), loc="upper left", borderaxespad=0.)
+    plt.xlabel("PC1"); plt.ylabel("PC2"); plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+
+# ------- Legacy apply guard: ensure test has all training batch levels ---- #
+
+def augment_test_for_missing_train_levels(
+    cov_te_df: pd.DataFrame,
+    Xte_arr: np.ndarray,
+    site_col: str,
+    missing_levels: List[str],
+    age_col: Optional[str] = None,
+    age_fill: Optional[float] = None
+) -> Tuple[pd.DataFrame, np.ndarray, int]:
+    """
+    Ensure test covars contain at least one row for every training batch level.
+    Appends 1 dummy row per missing level (with age filled), and duplicates a
+    baseline feature row so shapes match. Returns (cov_te_aug, Xte_aug, n_added).
+    """
+    if not missing_levels:
+        return cov_te_df, Xte_arr, 0
+
+    rows = []
+    for lvl in missing_levels:
+        row = {site_col: str(lvl)}
+        if age_col and age_col in cov_te_df.columns:
+            row[age_col] = age_fill if age_fill is not None else float(np.nanmedian(cov_te_df[age_col].values))
+        rows.append(row)
+
+    add_df = pd.DataFrame(rows)
+    cov_te_aug = pd.concat([cov_te_df, add_df], ignore_index=True)
+
+    n_added = len(missing_levels)
+    n_feat = Xte_arr.shape[1]
+    base = Xte_arr[0:1] if Xte_arr.shape[0] else np.zeros((1, n_feat), dtype=np.float32)
+    add_X = np.repeat(base, n_added, axis=0)
+    Xte_aug = np.vstack([Xte_arr, add_X]).astype(np.float32)
+    return cov_te_aug, Xte_aug, n_added
+
+
+# --------------------------------- Main --------------------------------- #
 
 def main():
     ap = argparse.ArgumentParser(
@@ -232,8 +275,18 @@ def main():
     ap.add_argument("--vectorize", choices=["upper", "flatten", "auto"], default="upper",
                     help="If --features is a MANIFEST, how to vectorize per-subject files.")
     ap.add_argument("--cv-handle-rare", choices=["merge", "drop", "ignore"], default="merge",
-                    help="How to handle tiny site classes for CV labels.")
-    ap.add_argument("--min-per-site", type=int, default=2, help="Sites with < this many samples are 'rare'.")
+                    help="How to handle tiny site classes for CV labels (does not touch harmonization labels).")
+    ap.add_argument("--min-per-site", type=int, default=2, help="Sites with < this many samples are 'rare' for CV.")
+    ap.add_argument("--no-auc", action="store_true",
+                    help="Skip pre/post site AUC to save time.")
+    ap.add_argument("--auc-max-features", type=int, default=None,
+                    help="If set, subsample this many feature columns for AUC only.")
+    ap.add_argument("--pca", action="store_true",
+                    help="Compute PCA (2D) per fold, colored by SITE; saves CSV and PNG.")
+    ap.add_argument("--pca-max-features", type=int, default=None,
+                    help="If set, subsample this many feature columns for PCA only (defaults to --auc-max-features).")
+    ap.add_argument("--pca-sample", type=int, default=None,
+                    help="Randomly subsample this many subjects for PCA plots per fold.")
     ap.add_argument("--out-dir", required=True, help="Output directory for per-fold results.")
     ap.add_argument("--prefix", required=True, help="Prefix for outputs.")
     ap.add_argument("--no-progress", action="store_true", help="Disable progress bars.")
@@ -243,7 +296,7 @@ def main():
     args = ap.parse_args()
     setup_logging(args.verbose)
     progress = not args.no_progress
-    
+
     banner("LOAD")
     features_path = Path(args.features)
     covars_path = Path(args.covars)
@@ -258,6 +311,7 @@ def main():
     if args.age_max is not None:
         C_df = C_df[C_df[args.age_col] <= args.age_max]
 
+    # Align by id
     X_df[args.id_col] = X_df[args.id_col].astype(str)
     C_df[args.id_col] = C_df[args.id_col].astype(str)
 
@@ -269,26 +323,18 @@ def main():
     X_df = X_df.set_index(args.id_col).loc[keep_ids].reset_index()
     C_df = C_df.set_index(args.id_col).loc[keep_ids].reset_index()
 
-    # Harmonization labels
-
-
+    # Normalize SITE labels; normalize ref label similarly
     C_df[args.site_col] = C_df[args.site_col].astype(str).str.strip()
-    # If you want case-insensitive matching, uncomment the next two lines and pass an uppercased --ref-batch:
-    C_df[args.site_col] = C_df[args.site_col].str.upper()
-    
-    # Normalize the ref label the same way
     ref_label = None if args.ref_batch is None else str(args.ref_batch).strip()
-    # If you uppercased SITE above, also do:
-    ref_label = ref_label.upper() if ref_label is not None else None
 
-
+    # Validate ref presence (in the whole dataset; may be absent in a test fold)
     if ref_label is not None and ref_label not in set(C_df[args.site_col].unique()):
         print(f"[error] --ref-batch '{ref_label}' not found in column '{args.site_col}'.", flush=True)
-        uniq = C_df[args.site_col].value_counts().head(20)
-        print(f"[hint] Top site labels:\n{uniq}", flush=True)
+        uniq = C_df[args.site_col].value_counts()
+        print(f"[hint] Top site labels:\n{uniq.head(20)}", flush=True)
         sys.exit(2)
 
-    # Ensure AGE numeric
+    # Ensure AGE is numeric (fail fast)
     if args.age_col in C_df.columns:
         C_df[args.age_col] = pd.to_numeric(C_df[args.age_col], errors="coerce")
         bad_age = C_df[args.age_col].isna()
@@ -297,7 +343,7 @@ def main():
             print("[error] AGE has non-numeric/missing values. Examples:\n", examples, flush=True)
             sys.exit(2)
 
-    # Feature matrix
+    # Features matrix
     X = X_df.drop(columns=[args.id_col])
     if not np.issubdtype(X.dtypes.values[0], np.number):
         X = X.apply(pd.to_numeric, errors="coerce")
@@ -309,12 +355,12 @@ def main():
             X = X.loc[mask].reset_index(drop=True)
             C_df = C_df.loc[mask].reset_index(drop=True)
 
-    # ---------------- CV labels (only for splitting & AUC) ---------------- #
+    # ---------------- CV labels (only for splitting & AUC/PCA) ---------------- #
     banner("CV LABELS")
     sites_raw = C_df[args.site_col].astype(str).values
     sites_series = pd.Series(sites_raw)
     counts = sites_series.value_counts()
-    rare = [lab for lab, cnt in counts.items() if cnt < args.min_per_site and lab != ref_label]
+    rare = [lab for lab, cnt in counts.items() if cnt < args.min_per_site and (ref_label is None or lab != ref_label)]
 
     action = "ignore"
     if args.cv_handle_rare == "drop" and rare:
@@ -334,18 +380,13 @@ def main():
           f"ref='{ref_label}' count: {int((C_df[args.site_col]==ref_label).sum()) if ref_label else 0} | "
           f"rare-handling: {action}", flush=True)
 
-    # ---------------- Build CV splitter (ensure ref in each test fold) ---- #
+    # ---------------- Build CV splitter (auto-reduce if classes too small) ---- #
     banner("CV SPLIT")
-    n_splits = int(args.folds)
-    if ref_label is not None:
-        ref_n = int(pd.Series(cv_sites).value_counts().get(ref_label, 0))
-        n_splits = min(n_splits, ref_n)  # each test fold needs ≥1 ref sample
-    if n_splits < 2:
-        print(f"[error] Not enough '{ref_label}' samples for CV (need ≥2).", flush=True)
-        sys.exit(3)
-    if n_splits != args.folds:
-        print(f"[warn] Reducing folds from {args.folds} to {n_splits} so every test fold has ≥1 '{ref_label}' sample.",
-              flush=True)
+    desired_splits = int(args.folds)
+    min_class = int(pd.Series(cv_sites).value_counts().min())
+    n_splits = max(2, min(desired_splits, min_class))  # need ≥2 and ≤ min class count
+    if n_splits != desired_splits:
+        print(f"[warn] Reducing folds from {desired_splits} to {n_splits} to satisfy class counts.", flush=True)
 
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
@@ -364,26 +405,25 @@ def main():
         cov_tr = C_df.iloc[tr_idx].copy()
         cov_te = C_df.iloc[te_idx].copy()
 
-        # Skip fold if test set lacks the reference batch
-        if ref_label is not None:
-            te_has_ref = (cov_te[args.site_col].astype(str) == ref_label).any()
-            if not te_has_ref:
-                if pbar is None:
-                    print(f"[{fold}/{n_splits}] skip: no '{ref_label}' in TEST", flush=True)
-                else:
-                    pbar.set_postfix_str("skip: no ref in test"); pbar.update(1)
-                continue
+        # ------------------ Pre-harmonization AUC (optional) ------------------ #
+        if args.no_auc:
+            pre_auc = float("nan")
+        else:
+            if pbar is not None: pbar.set_postfix_str("AUC pre")
+            Xtr_pre, Xte_pre = sanitize_for_auc(Xtr, Xte, tag="pre")
+            if args.auc_max_features is not None:
+                Xtr_pre, Xte_pre = subsample_features(Xtr_pre, Xte_pre, args.auc_max_features)
+            pre_auc = site_auc_on_test(Xtr_pre, cv_sites[tr_idx], Xte_pre, cv_sites[te_idx])
 
-        # Pre-harmonization AUC
-        if pbar is not None: pbar.set_postfix_str("AUC pre")
-        Xtr_pre, Xte_pre = sanitize_for_auc(Xtr, Xte, tag="pre")
-        pre_auc = site_auc_on_test(Xtr_pre, cv_sites[tr_idx], Xte_pre, cv_sites[te_idx])
+        # --------------- Harmonization (fit on train, apply to test) ---------- #
+        if pbar is not None: pbar.set_postfix_str("harmonizing")
 
+        cov_tr0 = cov_tr.copy()
+        cov_te0 = cov_te.copy()
+        cov_tr0[args.site_col] = cov_tr0[args.site_col].astype(str).str.strip()
+        cov_te0[args.site_col] = cov_te0[args.site_col].astype(str).str.strip()
 
-        # Harmonization covariates: batch + AGE (exclude SEX to avoid numeric-cast)
-        cov_tr0 = cov_tr.copy(); cov_te0 = cov_te.copy()
-        cov_tr0[args.site_col] = cov_tr0[args.site_col].astype(str)
-        cov_te0[args.site_col] = cov_te0[args.site_col].astype(str)
+        # Keep only batch + AGE for harmonization
         keep_cols = [args.site_col]
         if args.age_col in cov_tr0.columns:
             keep_cols.append(args.age_col)
@@ -396,7 +436,20 @@ def main():
                 print("[error] Non-numeric AGE encountered after split; check covariates.", flush=True)
                 sys.exit(4)
 
-        # Harmonization (new API, else legacy fallback)
+        # Make sure test has all training batch levels (legacy apply quirk)
+        train_levels = sorted(cov_tr_use[args.site_col].astype(str).unique().tolist())
+        test_levels = set(cov_te_use[args.site_col].astype(str))
+        missing_levels = [lvl for lvl in train_levels if lvl not in test_levels]
+        age_fill = float(np.nanmedian(cov_tr_use[args.age_col].values)) if (args.age_col in cov_tr_use.columns) else None
+        cov_te_aug, Xte_aug, n_added = augment_test_for_missing_train_levels(
+            cov_te_use, Xte, args.site_col, missing_levels,
+            age_col=(args.age_col if args.age_col in cov_tr_use.columns else None),
+            age_fill=age_fill
+        )
+        if n_added:
+            print(f"[info] Fold {fold}: added {n_added} dummy test row(s) for missing batches: {missing_levels}", flush=True)
+
+        # Fit/apply (new API first, then legacy fallback)
         def _fit_apply(Xtr_arr, cov_tr_df, Xte_arr, cov_te_df, smooth_terms, site_col, ref_label_):
             try:
                 model, Xtr_adj_ = harmonizationLearn(
@@ -416,45 +469,70 @@ def main():
             Xte_adj_ = harmonizationApply(Xte_arr, cov_te_old, model)
             return Xtr_adj_, Xte_adj_
 
-        if pbar is not None: pbar.set_postfix_str("harmonizing")
-        
-        # Determine training batch levels and missing ones in TEST
-        train_levels = sorted(cov_tr_use[args.site_col].astype(str).unique().tolist())
-        test_levels = set(cov_te_use[args.site_col].astype(str))
-        missing_levels = [lvl for lvl in train_levels if lvl not in test_levels]
-        
-        # Fill value for AGE (if present)
-        age_fill = None
-        if args.age_col in cov_tr_use.columns:
-            age_fill = float(np.nanmedian(cov_tr_use[args.age_col].values))
-        
-        # Augment TEST covars/features to include all training levels
-        cov_te_aug, Xte_aug, n_added = augment_test_for_missing_train_levels(
-            cov_te_use, Xte, args.site_col, missing_levels,
-            age_col=(args.age_col if args.age_col in cov_tr_use.columns else None),
-            age_fill=age_fill
-        )
-        if n_added:
-            print(f"[info] Fold {fold}: added {n_added} dummy row(s) to TEST for missing batches: {missing_levels}", flush=True)
-        
-        # Fit/apply (with possibly augmented TEST)
         smooth_terms = [args.age_col] if (args.mode == "gam" and args.age_col in cov_tr_use.columns) else []
         Xtr_adj, Xte_adj_full = _fit_apply(
-            Xtr, cov_tr_use,
-            Xte_aug, cov_te_aug,
-            smooth_terms=smooth_terms,
-            site_col=args.site_col,
-            ref_label_=ref_label
+            Xtr, cov_tr_use, Xte_aug, cov_te_aug,
+            smooth_terms=smooth_terms, site_col=args.site_col, ref_label_=ref_label
         )
-        
         # Drop dummy rows from adjusted TEST
         Xte_adj = Xte_adj_full[:Xte.shape[0], :]
 
+        # ---------------------- Post-harmonization AUC ------------------------ #
+        if args.no_auc:
+            post_auc = float("nan")
+        else:
+            if pbar is not None: pbar.set_postfix_str("AUC post")
+            Xtr_post, Xte_post = sanitize_for_auc(Xtr_adj, Xte_adj, tag="post")
+            if args.auc_max_features is not None:
+                Xtr_post, Xte_post = subsample_features(Xtr_post, Xte_post, args.auc_max_features)
+            post_auc = site_auc_on_test(Xtr_post, cv_sites[tr_idx], Xte_post, cv_sites[te_idx])
 
-        if pbar is not None: pbar.set_postfix_str("AUC post")
-        Xtr_post, Xte_post = sanitize_for_auc(Xtr_adj, Xte_adj, tag="post")
-        post_auc = site_auc_on_test(Xtr_post, cv_sites[tr_idx], Xte_post, cv_sites[te_idx])
+        # --------------------------- PCA by SITE ------------------------------ #
+        if args.pca:
+            # use pca_max_features if set, else fall back to auc cap
+            pca_k = args.pca_max_features if args.pca_max_features is not None else args.auc_max_features
 
+            # PRE
+            Xtr_pre_vis, Xte_pre_vis = sanitize_for_auc(Xtr, Xte, tag="pca_pre")
+            Xtr_pre_vis, Xte_pre_vis = subsample_features(Xtr_pre_vis, Xte_pre_vis, pca_k)
+            X_pre_all = np.vstack([Xtr_pre_vis, Xte_pre_vis])
+            pca = PCA(n_components=2, svd_solver="randomized", random_state=42)
+            Z_pre = pca.fit_transform(X_pre_all)
+            Ztr_pre, Zte_pre = Z_pre[:Xtr_pre_vis.shape[0]], Z_pre[Xtr_pre_vis.shape[0]:]
+            df_pre = pd.DataFrame({
+                "PC1": np.r_[Ztr_pre[:, 0], Zte_pre[:, 0]],
+                "PC2": np.r_[Ztr_pre[:, 1], Zte_pre[:, 1]],
+                "SITE": np.r_[cov_tr[args.site_col].astype(str).values, cov_te[args.site_col].astype(str).values],
+                "split": ["train"] * len(Ztr_pre) + ["test"] * len(Zte_pre)
+            })
+            df_pre["SITE"] = df_pre["SITE"].astype(str).str.strip()
+            df_pre_plot = maybe_subsample_rows(df_pre, args.pca_sample)
+
+            # POST
+            Xtr_post_vis, Xte_post_vis = sanitize_for_auc(Xtr_adj, Xte_adj, tag="pca_post")
+            Xtr_post_vis, Xte_post_vis = subsample_features(Xtr_post_vis, Xte_post_vis, pca_k)
+            X_post_all = np.vstack([Xtr_post_vis, Xte_post_vis])
+            pca2 = PCA(n_components=2, svd_solver="randomized", random_state=42)
+            Z_post = pca2.fit_transform(X_post_all)
+            Ztr_post, Zte_post = Z_post[:Xtr_post_vis.shape[0]], Z_post[Xtr_post_vis.shape[0]:]
+            df_post = pd.DataFrame({
+                "PC1": np.r_[Ztr_post[:, 0], Zte_post[:, 0]],
+                "PC2": np.r_[Ztr_post[:, 1], Zte_post[:, 1]],
+                "SITE": np.r_[cov_tr[args.site_col].astype(str).values, cov_te[args.site_col].astype(str).values],
+                "split": ["train"] * len(Ztr_post) + ["test"] * len(Zte_post)
+            })
+            df_post["SITE"] = df_post["SITE"].astype(str).str.strip()
+            df_post_plot = maybe_subsample_rows(df_post, args.pca_sample)
+
+            # save outputs
+            pre_csv  = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_pca_pre.csv"
+            post_csv = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_pca_post.csv"
+            pre_png  = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_pca_pre.png"
+            post_png = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_pca_post.png"
+            df_pre.to_csv(pre_csv, index=False)
+            df_post.to_csv(post_csv, index=False)
+            pca_scatter(df_pre_plot,  f"PCA pre (fold {fold})",  pre_png)
+            pca_scatter(df_post_plot, f"PCA post (fold {fold})", post_png)
 
         per_fold.append({
             "fold": fold,
@@ -481,10 +559,7 @@ def main():
     print(f"Wrote {res_path}", flush=True)
 
     if executed == 0:
-        print("[error] 0 folds executed. Likely every test fold lacked the reference batch "
-              f"('{ref_label}') or stratification was impossible with current settings.\n"
-              "Try: --folds 3  OR  use --site-col/BATCH consistent with --ref-batch  OR  "
-              "--cv-handle-rare merge --min-per-site <larger>.", flush=True)
+        print("[error] 0 folds executed. Check CV class counts, site labels, or flags.", flush=True)
         sys.exit(5)
 
     pre_mean = np.nanmean(res["pre_auc"].values.astype(float)) if len(res) else float("nan")
