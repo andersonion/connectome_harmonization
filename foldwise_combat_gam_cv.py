@@ -166,6 +166,33 @@ def read_numeric_or_manifest(features_path: Path, id_col: str, vectorize: str, p
 
 # ------------------------------ Metrics -------------------------------- #
 
+
+def sanitize_for_auc(Xtr: np.ndarray, Xte: np.ndarray, *, tag: str = ""):
+    """
+    Replace NaN/Inf in Xtr/Xte with column means computed on Xtr.
+    Columns that are entirely non-finite in Xtr get mean=0.0.
+    Returns cleaned float32 arrays.
+    """
+    A_tr = np.asarray(Xtr, dtype=np.float32, order="C").copy()
+    A_te = np.asarray(Xte, dtype=np.float32, order="C").copy()
+
+    fin_tr = np.isfinite(A_tr)
+    fin_te = np.isfinite(A_te)
+
+    with np.errstate(invalid="ignore"):
+        col_mean = np.nanmean(np.where(fin_tr, A_tr, np.nan), axis=0)
+
+    col_mean = np.where(np.isfinite(col_mean), col_mean, 0.0).astype(np.float32)
+
+    # broadcast per-column means to bad entries
+    A_tr = np.where(fin_tr, A_tr, col_mean)
+    A_te = np.where(fin_te, A_te, col_mean)
+
+    # optional: tiny jitter if a column becomes constant
+    # (LogReg is usually fine without it; keep simple)
+    return A_tr, A_te
+
+
 def site_auc_on_test(Xtr: np.ndarray, ytr, Xte: np.ndarray, yte) -> float:
     """Train site classifier on (Xtr,ytr); ROC-AUC on (Xte,yte)."""
     ytr = np.asarray(ytr); yte = np.asarray(yte)
@@ -349,7 +376,9 @@ def main():
 
         # Pre-harmonization AUC
         if pbar is not None: pbar.set_postfix_str("AUC pre")
-        pre_auc = site_auc_on_test(Xtr, cv_sites[tr_idx], Xte, cv_sites[te_idx])
+        Xtr_pre, Xte_pre = sanitize_for_auc(Xtr, Xte, tag="pre")
+        pre_auc = site_auc_on_test(Xtr_pre, cv_sites[tr_idx], Xte_pre, cv_sites[te_idx])
+
 
         # Harmonization covariates: batch + AGE (exclude SEX to avoid numeric-cast)
         cov_tr0 = cov_tr.copy(); cov_te0 = cov_te.copy()
@@ -423,7 +452,9 @@ def main():
 
 
         if pbar is not None: pbar.set_postfix_str("AUC post")
-        post_auc = site_auc_on_test(Xtr_adj, cv_sites[tr_idx], Xte_adj, cv_sites[te_idx])
+        Xtr_post, Xte_post = sanitize_for_auc(Xtr_adj, Xte_adj, tag="post")
+        post_auc = site_auc_on_test(Xtr_post, cv_sites[tr_idx], Xte_post, cv_sites[te_idx])
+
 
         per_fold.append({
             "fold": fold,
