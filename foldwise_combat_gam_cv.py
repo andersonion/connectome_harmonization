@@ -4,14 +4,17 @@
 """
 Fold-wise ComBat / ComBat-GAM CV with optional anchoring to a reference batch.
 
-Key features:
-- Accepts numeric features OR a manifest (subject_id + filepath) and auto-vectorizes per-subject matrices
-- Normalizes SITE labels, enforces numeric AGE, excludes SEX from harmonization covariates
-- Compatible with neuroHarmonize new API (batch_col=...) and legacy API (requires 'SITE')
-- Augments test covars with dummy rows for missing training batch levels (prevents ref_level index errors)
-- Stratified CV with auto reduction of folds based on smallest class count
-- Optional pre/post site-prediction AUC (with train-mean imputation, feature subsampling)
-- Optional PCA colored by SITE (pre/post) saved as CSV + PNG per fold
+Adds:
+- Per-fold saving of harmonized features (train/test) via --save-harmonized
+  * --save-format {csv,npz}, default csv
+  * --save-pre to also dump raw (pre-harmonization) features
+- Manifest auto-vectorization (upper triangle) with progress bar
+- SITE normalization, AGE numeric enforcement, exclude SEX from harmonization covars
+- neuroHarmonize API compatibility (new batch_col=... and legacy 'SITE')
+- Dummy-row augmentation so test has all training batch levels (prevents ref_level errors)
+- Stratified CV with auto fold reduction to min class count
+- Optional pre/post site AUC (with train-mean imputation, feature subsampling)
+- Optional PCA colored by SITE (pre/post), CSV + PNG per fold
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.decomposition import PCA
 
-# plotting headless
+# headless plotting
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -138,7 +141,7 @@ def read_numeric_or_manifest(features_path: Path, id_col: str, vectorize: str, p
 
 # ------------------------------ AUC helpers ----------------------------- #
 
-def sanitize_for_auc(Xtr: np.ndarray, Xte: np.ndarray, *, tag: str = "") -> Tuple[np.ndarray, np.ndarray]:
+def sanitize_for_auc(Xtr: np.ndarray, Xte: np.ndarray, *, tag: str = "") -> tuple[np.ndarray, np.ndarray]:
     """
     Replace NaN/Inf in Xtr/Xte with column means computed on Xtr.
     Columns entirely non-finite in Xtr get mean=0.0. Returns float32 arrays.
@@ -287,6 +290,12 @@ def main():
                     help="If set, subsample this many feature columns for PCA only (defaults to --auc-max-features).")
     ap.add_argument("--pca-sample", type=int, default=None,
                     help="Randomly subsample this many subjects for PCA plots per fold.")
+    ap.add_argument("--save-harmonized", action="store_true",
+                    help="Save per-fold harmonized features to disk (train/test).")
+    ap.add_argument("--save-format", choices=["csv", "npz"], default="csv",
+                    help="File format for saved harmonized features.")
+    ap.add_argument("--save-pre", action="store_true",
+                    help="Also save raw (pre-harmonization) features for train/test per fold.")
     ap.add_argument("--out-dir", required=True, help="Output directory for per-fold results.")
     ap.add_argument("--prefix", required=True, help="Prefix for outputs.")
     ap.add_argument("--no-progress", action="store_true", help="Disable progress bars.")
@@ -354,6 +363,7 @@ def main():
             mask = ~X.isnull().any(axis=1)
             X = X.loc[mask].reset_index(drop=True)
             C_df = C_df.loc[mask].reset_index(drop=True)
+            X_df = X_df.loc[mask].reset_index(drop=True)  # keep IDs aligned for saving
 
     # ---------------- CV labels (only for splitting & AUC/PCA) ---------------- #
     banner("CV LABELS")
@@ -367,6 +377,7 @@ def main():
         keep_mask = ~sites_series.isin(rare)
         X = X.loc[keep_mask].reset_index(drop=True)
         C_df = C_df.loc[keep_mask].reset_index(drop=True)
+        X_df = X_df.loc[keep_mask].reset_index(drop=True)
         cv_sites = sites_series[keep_mask].astype(str).values
         action = f"drop {sorted(rare)}"
     elif args.cv_handle_rare == "merge" and rare:
@@ -398,6 +409,10 @@ def main():
     for fold, (tr_idx, te_idx) in enumerate(fold_iter, start=1):
         if pbar is None:
             print(f"[{fold}/{n_splits}] start", flush=True)
+
+        # indices & IDs for saving
+        ids_tr = X_df.iloc[tr_idx][args.id_col].astype(str).values
+        ids_te = X_df.iloc[te_idx][args.id_col].astype(str).values
 
         Xtr = X.iloc[tr_idx].values.astype(np.float32)
         Xte = X.iloc[te_idx].values.astype(np.float32)
@@ -524,7 +539,7 @@ def main():
             df_post["SITE"] = df_post["SITE"].astype(str).str.strip()
             df_post_plot = maybe_subsample_rows(df_post, args.pca_sample)
 
-            # save outputs
+            # save PCA outputs
             pre_csv  = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_pca_pre.csv"
             post_csv = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_pca_post.csv"
             pre_png  = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_pca_pre.png"
@@ -534,6 +549,43 @@ def main():
             pca_scatter(df_pre_plot,  f"PCA pre (fold {fold})",  pre_png)
             pca_scatter(df_post_plot, f"PCA post (fold {fold})", post_png)
 
+        # ---------------------- Save harmonized features ---------------------- #
+        if args.save_harmonized:
+            feat_cols = list(X.columns)
+            # Harmonized TRAIN
+            df_tr_h = pd.DataFrame(Xtr_adj, columns=feat_cols)
+            df_tr_h.insert(0, args.id_col, ids_tr)
+            # Harmonized TEST
+            df_te_h = pd.DataFrame(Xte_adj, columns=feat_cols)
+            df_te_h.insert(0, args.id_col, ids_te)
+
+            if args.save_format == "csv":
+                out_tr = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_harmonized_train.csv"
+                out_te = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_harmonized_test.csv"
+                df_tr_h.to_csv(out_tr, index=False)
+                df_te_h.to_csv(out_te, index=False)
+            else:
+                out_tr = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_harmonized_train.npz"
+                out_te = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_harmonized_test.npz"
+                np.savez_compressed(out_tr, X=df_tr_h[feat_cols].values, ids=ids_tr)
+                np.savez_compressed(out_te, X=df_te_h[feat_cols].values, ids=ids_te)
+
+            if args.save_pre:
+                # Raw TRAIN/TEST (pre-harmonization)
+                if args.save_format == "csv":
+                    out_tr_raw = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_raw_train.csv"
+                    out_te_raw = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_raw_test.csv"
+                    df_tr_raw = pd.DataFrame(Xtr, columns=feat_cols); df_tr_raw.insert(0, args.id_col, ids_tr)
+                    df_te_raw = pd.DataFrame(Xte, columns=feat_cols); df_te_raw.insert(0, args.id_col, ids_te)
+                    df_tr_raw.to_csv(out_tr_raw, index=False)
+                    df_te_raw.to_csv(out_te_raw, index=False)
+                else:
+                    out_tr_raw = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_raw_train.npz"
+                    out_te_raw = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_raw_test.npz"
+                    np.savez_compressed(out_tr_raw, X=Xtr, ids=ids_tr)
+                    np.savez_compressed(out_te_raw, X=Xte, ids=ids_te)
+
+        # ------------------------ Fold summary row ---------------------------- #
         per_fold.append({
             "fold": fold,
             "n_train": int(len(tr_idx)),
