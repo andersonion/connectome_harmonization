@@ -372,7 +372,9 @@ def main():
 
         executed += 1
 
-    print(f"Wrote OOF matrices for {len(oof_dir.glob('*.csv'))} subjects to {oof_dir}")
+    n_written = sum(1 for _ in oof_dir.glob("*.csv"))
+    print(f"Wrote OOF matrices for {n_written} subjects to {oof_dir}", flush=True)
+
     if executed == 0:
         print("[error] 0 folds executed. Check SITE label counts or --cv-folds.", flush=True)
         sys.exit(5)
