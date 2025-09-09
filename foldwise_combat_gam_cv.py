@@ -3,23 +3,16 @@
 
 """
 Fold-wise ComBat / ComBat-GAM that writes per-subject matrices (N×N),
-optionally runs diagnostics (AUC/PCA), and makes subject pre/post/diff plots.
+runs optional diagnostics (AUC/PCA), and makes subject pre/post/diff plots.
 
 - Works with numeric features (id + edges...) or a manifest (id, filepath)
   of per-subject matrices to vectorize (upper triangle, k=1).
-- Supports DWI (non-negative weights): log1p -> harmonize -> expm1 (+clip)
-- Supports fMRI (signed correlations): no transform; negatives preserved.
+- DWI (non-negative): log1p -> harmonize -> expm1 (+optional clip >=0)
+- fMRI (signed): no transform.
 
 Modes:
-  * OOF (no leakage): --cv-folds > 0  → writes {prefix}_matrices_oof/<ID>_harmonized.csv
-  * Full-fit:         --cv-folds 0    → writes {prefix}_matrices_full/<ID>_harmonized.csv
-
-Diagnostics (if --diagnostics):
-  * AUC pre/post per fold → {prefix}_cv_auc.csv
-  * PCA pre/post per fold (if --pca) → CSV+PNG per fold
-
-Subject plots (if --subject-plots N):
-  * {prefix}_subject_plots/{ID}_pre_post_diff.png
+  * OOF (no leakage): --cv-folds > 0  → {prefix}_matrices_oof/<ID>_harmonized.csv
+  * Full-fit:         --cv-folds 0    → {prefix}_matrices_full/<ID>_harmonized.csv
 """
 
 from __future__ import annotations
@@ -30,23 +23,19 @@ from typing import Optional, List, Tuple, Dict
 import numpy as np
 import pandas as pd
 
-# Harmonization
 from neuroHarmonize import harmonizationLearn, harmonizationApply
 
-# CV / diagnostics
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.decomposition import PCA
 
-# Plotting (headless)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm, SymLogNorm, TwoSlopeNorm
 
-# Progress
 try:
     from tqdm import tqdm
 except Exception:
@@ -125,7 +114,6 @@ def read_features(features_path: Path, id_col: str, manifest_vectorize: bool, pr
     return out, None
 
 def infer_nodes_from_edges(m: int) -> Optional[int]:
-    # Solve m = N*(N-1)/2
     disc = 1 + 8*m
     rt = int(math.isqrt(disc))
     if rt*rt != disc: return None
@@ -156,17 +144,12 @@ def inverse_transform(X: np.ndarray, kind: str) -> np.ndarray:
     return X
 
 def resolve_pretransform(modality: str, pre_transform: str, X_preview: np.ndarray) -> str:
-    """
-    Decide transform: explicit pre_transform wins; else modality; else auto.
-    Auto: if any negative in X → 'none', else 'log1p'.
-    """
     if pre_transform != "auto":
         return pre_transform
     if modality == "dwi":
         return "log1p"
     if modality == "fmri":
         return "none"
-    # auto
     return "none" if np.nanmin(X_preview) < 0 else "log1p"
 
 
@@ -176,7 +159,6 @@ def learn_apply(Xtr: np.ndarray, cov_tr: pd.DataFrame,
                 Xte: np.ndarray, cov_te: pd.DataFrame,
                 site_col: str, age_col: Optional[str],
                 mode: str, ref_batch: Optional[str]) -> Tuple[np.ndarray, np.ndarray]:
-    """Try new API (batch_col=...), fallback to legacy 'SITE'."""
     smooth_terms = [age_col] if (mode == "gam" and age_col and age_col in cov_tr.columns) else []
     try:
         model, Xtr_adj = harmonizationLearn(
@@ -199,7 +181,6 @@ def learn_apply(Xtr: np.ndarray, cov_tr: pd.DataFrame,
 def augment_test_levels(cov_te: pd.DataFrame, Xte: np.ndarray,
                         site_col: str, missing: List[str],
                         age_col: Optional[str] = None, age_fill: Optional[float] = None) -> Tuple[pd.DataFrame, np.ndarray, int]:
-    """Add one dummy row per missing training batch level (legacy apply quirk)."""
     if not missing:
         return cov_te, Xte, 0
     rows = []
@@ -267,30 +248,56 @@ def pca_scatter(df: pd.DataFrame, title: str, out_png: Path):
 # ----------------------- Subject plotting helpers ---------------------- #
 
 def auto_norm_for_panel(A: np.ndarray, modality: str, eps: float = 1e-6):
-    vmin, vmax = float(np.nanmin(A)), float(np.nanmax(A))
     if modality == "dwi":
+        A = np.asarray(A, float)
         pos = A[A > 0]
         vmin_pos = float(pos.min()) if pos.size else eps
-        return LogNorm(vmin=max(eps, vmin_pos), vmax=max(eps, vmax))
-    # fmri (signed)
-    M = float(max(abs(vmin), abs(vmax), 1e-6))
+        vmax = float(max(np.nanmax(A), eps))
+        return LogNorm(vmin=max(eps, vmin_pos), vmax=vmax)
+    M = float(max(np.nanmax(np.abs(A)), 1e-6))
     return SymLogNorm(linthresh=1e-3, vmin=-M, vmax=M, base=10)
 
 def plot_subject_triptych(A_pre: np.ndarray, A_post: np.ndarray, sid: str, out_png: Path, modality: str, eps: float = 1e-6):
+    # DWI: ensure zeros are visible under LogNorm (plotting only)
+    if modality == "dwi":
+        A_pre_p  = np.clip(A_pre,  eps, None)
+        A_post_p = np.clip(A_post, eps, None)
+    else:
+        A_pre_p, A_post_p = A_pre, A_post
+
     D = A_post - A_pre
-    norm_pre  = auto_norm_for_panel(A_pre,  modality, eps)
-    norm_post = auto_norm_for_panel(A_post, modality, eps)
-    Md = float(max(abs(np.nanmin(D)), abs(np.nanmax(D)), 1e-9))
+    norm_pre  = auto_norm_for_panel(A_pre_p if modality=="dwi" else A_pre,  modality, eps)
+    norm_post = auto_norm_for_panel(A_post_p if modality=="dwi" else A_post, modality, eps)
+    Md = float(max(np.nanmax(np.abs(D)), 1e-9))
     norm_diff = TwoSlopeNorm(vmin=-Md, vcenter=0.0, vmax=Md)
 
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    im0 = axes[0].imshow(A_pre,  norm=norm_pre);  axes[0].set_title("Pre")
-    im1 = axes[1].imshow(A_post, norm=norm_post); axes[1].set_title("Post")
-    im2 = axes[2].imshow(D,      norm=norm_diff, cmap="bwr"); axes[2].set_title("Post − Pre")
+    im0 = axes[0].imshow(A_pre_p if modality=="dwi" else A_pre,  norm=norm_pre);  axes[0].set_title("Pre")
+    im1 = axes[1].imshow(A_post_p if modality=="dwi" else A_post, norm=norm_post); axes[1].set_title("Post")
+    im2 = axes[2].imshow(D,        norm=norm_diff, cmap="bwr"); axes[2].set_title("Post − Pre")
     for ax, im in zip(axes, (im0, im1, im2)):
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         ax.set_xticks([]); ax.set_yticks([])
     fig.suptitle(str(sid)); fig.tight_layout(); fig.savefig(out_png, dpi=150); plt.close(fig)
+
+
+# ----------------------- Variance/NaN safety helpers ------------------- #
+
+def split_by_train_variance(Xtr: np.ndarray, Xte: np.ndarray, eps: float = 1e-8):
+    std = Xtr.std(axis=0)
+    keep = std > eps
+    return Xtr[:, keep], Xte[:, keep], keep
+
+def nan_fix_dwi(arr: np.ndarray) -> np.ndarray:
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+def nan_fix_fmri(arr: np.ndarray) -> np.ndarray:
+    cm = np.nanmean(arr, axis=0)
+    cm = np.where(np.isfinite(cm), cm, 0.0)
+    mask = ~np.isfinite(arr)
+    if mask.any():
+        arr[mask] = np.take(cm, np.where(mask)[1])
+    return arr
 
 
 # ---------------------------------- Main -------------------------------- #
@@ -314,9 +321,9 @@ def main():
 
     # Modality & transforms
     ap.add_argument("--modality", choices=["auto","dwi","fmri"], default="auto",
-                    help="Choose 'dwi' for non-negative edges (log1p/expm1), 'fmri' for signed edges, or 'auto'.")
+                    help="Choose 'dwi' (non-negative) or 'fmri' (signed), or 'auto'.")
     ap.add_argument("--pre-transform", choices=["auto","none","log1p"], default="auto",
-                    help="Override the transform used before harmonization.")
+                    help="Override transform used before harmonization.")
     ap.add_argument("--clip-nonneg", action="store_true",
                     help="After inverse transform (DWI), clip tiny negatives to 0.")
 
@@ -324,7 +331,7 @@ def main():
     ap.add_argument("--diagnostics", action="store_true", help="Run AUC/PCA diagnostics.")
     ap.add_argument("--auc-max-features", type=int, default=None, help="Subsample this many features for AUC only.")
     ap.add_argument("--pca", action="store_true", help="Save PCA (PC1/PC2) per fold, colored by SITE.")
-    ap.add_argument("--pca-max-features", type=int, default=None, help="Subsample features for PCA only (defaults to AUC cap).")
+    ap.add_argument("--pca-max-features", type=int, default=None, help="Subsample features for PCA (defaults to AUC cap).")
     ap.add_argument("--pca-sample", type=int, default=None, help="Randomly subsample this many subjects for PCA plots.")
     ap.add_argument("--diag-folds", type=int, default=3, help="Full-fit only: CV folds for diagnostics.")
 
@@ -343,7 +350,6 @@ def main():
     setup_logging(args.verbose)
     progress = not args.no_progress
 
-    # Tidy noisy warnings (non-fatal)
     warnings.filterwarnings("ignore", message="Degrees of freedom <= 0 for slice", category=RuntimeWarning)
     warnings.filterwarnings("ignore", message="invalid value encountered in divide", category=RuntimeWarning)
 
@@ -365,8 +371,7 @@ def main():
 
     # ---------- Load covariates ---------- #
     banner("LOAD COVARIATES")
-    covars_path = Path(args.covars)
-    C = pd.read_csv(covars_path)
+    C = pd.read_csv(Path(args.covars))
     if args.id_col not in C.columns:
         raise SystemExit(f"Covars missing id-col '{args.id_col}'.")
     C[args.id_col] = C[args.id_col].astype(str)
@@ -386,12 +391,12 @@ def main():
     C = C.set_index(args.id_col).loc[order].reset_index()
     ids_all = np.array(keep_ids, dtype=str)
 
-    # Decide transform
+    # Decide transform & modality
     pre_tf = resolve_pretransform(args.modality, args.pre_transform, X_raw[: min(256, len(X_raw))])
     modality = ("dwi" if pre_tf == "log1p" else "fmri") if args.modality == "auto" else args.modality
     print(f"INFO: modality={modality}, pre-transform={pre_tf}", flush=True)
 
-    # Keep a copy of PRE (original scale) for plots
+    # Keep PRE copy (original scale) for plots/diagnostics
     X_pre_for_plots = X_raw.copy()
     # Transform for harmonization
     X = forward_transform(X_raw, pre_tf).astype(np.float32)
@@ -401,34 +406,44 @@ def main():
         top = C[args.site_col].value_counts().head(20)
         raise SystemExit(f"--ref-batch '{ref_label}' not found in SITE. Top labels:\n{top}")
 
-    # Precompute tri indices
     r_idx, c_idx = np.triu_indices(N, k=1)
 
     # -------------------- FULL-FIT -------------------- #
     if args.cv_folds <= 0:
         banner("FULL FIT")
         cov_use = C[[args.site_col] + ([args.age_col] if args.age_col in C.columns else [])].copy()
+
+        # Drop zero-variance columns globally (on transformed X)
+        X_fit, _dummy, keep = split_by_train_variance(X, X, eps=1e-8)
+
         # Fit/apply
         try:
             model, _ = harmonizationLearn(
-                X, cov_use,
+                X_fit, cov_use,
                 smooth_terms=([args.age_col] if args.mode=="gam" and args.age_col in cov_use.columns else []),
                 batch_col=args.site_col, ref_batch=ref_label
             )
-            X_adj = harmonizationApply(X, cov_use, model)
+            X_adj_fit = harmonizationApply(X_fit, cov_use, model)
         except TypeError as e:
             if "batch_col" not in str(e): raise
             cov_old = cov_use.rename(columns={args.site_col: "SITE"})
             model, _ = harmonizationLearn(
-                X, cov_old,
+                X_fit, cov_old,
                 smooth_terms=([args.age_col] if args.mode=="gam" and args.age_col in cov_old.columns else []),
                 ref_batch=ref_label
             )
-            X_adj = harmonizationApply(X, cov_old, model)
-        # Inverse transform (back to original units)
+            X_adj_fit = harmonizationApply(X_fit, cov_old, model)
+
+        # Reconstruct full vectors (kept = harmonized; dropped = original transformed)
+        X_adj = np.zeros_like(X, dtype=np.float32)
+        X_adj[:, keep]  = X_adj_fit
+        X_adj[:, ~keep] = X[:, ~keep]
+
+        # Inverse transform & cleanup
         X_adj = inverse_transform(X_adj, pre_tf).astype(np.float32)
         if args.clip_nonneg and modality == "dwi":
             X_adj = np.maximum(X_adj, 0.0)
+        X_adj = nan_fix_dwi(X_adj) if modality == "dwi" else nan_fix_fmri(X_adj)
 
         # Write matrices
         mat_dir = Path(args.out_dir) / f"{args.prefix}_matrices_full"
@@ -437,7 +452,7 @@ def main():
             A = np.zeros((N,N), dtype=float); A[r_idx, c_idx] = v; A[c_idx, r_idx] = v; np.fill_diagonal(A, 0.0)
             np.savetxt(mat_dir / f"{sid}_harmonized.csv", A, fmt="%.6g", delimiter=",")
 
-        # Diagnostics (optional): run small CV on PRE vs POST
+        # Diagnostics (optional): small CV on PRE vs POST
         if args.diagnostics:
             banner("DIAGNOSTICS (full-fit)")
             n_splits = max(2, int(args.diag_folds))
@@ -445,7 +460,6 @@ def main():
             sites = C[args.site_col].astype(str).values
             per = []
             for fold, (tr, te) in enumerate(skf.split(np.arange(len(C)), sites), start=1):
-                # PRE/POST on original scale
                 Xtr_pre, Xte_pre = X_pre_for_plots[tr], X_pre_for_plots[te]
                 Xtr_post, Xte_post = X_adj[tr], X_adj[te]
                 # AUC pre
@@ -456,7 +470,7 @@ def main():
                 Xtr_s, Xte_s = sanitize_for_auc(Xtr_post, Xte_post)
                 Xtr_s, Xte_s = subsample_features(Xtr_s, Xte_s, args.auc_max_features, seed=args.seed)
                 post_auc = site_auc_on_test(Xtr_s, sites[tr], Xte_s, sites[te])
-                # PCA (optional)
+                # PCA
                 if args.pca:
                     k = args.pca_max_features if args.pca_max_features is not None else args.auc_max_features
                     # PRE
@@ -519,8 +533,7 @@ def main():
     rare = [lab for lab,cnt in vc.items() if cnt < args.min_per_site and (ref_label is None or lab != ref_label)]
     if args.cv_handle_rare == "drop" and rare:
         keep_mask = ~pd.Series(sites).isin(rare)
-        X = X[keep_mask.values]
-        X_pre_for_plots = X_pre_for_plots[keep_mask.values]
+        X = X[keep_mask.values]; X_pre_for_plots = X_pre_for_plots[keep_mask.values]
         C = C.loc[keep_mask.values].reset_index(drop=True)
         sites = C[args.site_col].astype(str).values
         ids_all = ids_all[keep_mask.values]
@@ -556,26 +569,40 @@ def main():
             if cov_tr_use[args.age_col].isna().any() or cov_te_use[args.age_col].isna().any():
                 raise SystemExit("Non-numeric AGE encountered after split.")
 
+        # Drop zero-variance features based on TRAIN only
+        Xtr_fit, Xte_fit, keep = split_by_train_variance(Xtr, Xte, eps=1e-8)
+
         # Ensure TEST has all TRAIN batches (legacy apply quirk)
         train_levels = sorted(cov_tr_use[args.site_col].astype(str).unique().tolist())
         test_levels  = set(cov_te_use[args.site_col].astype(str))
         missing = [lvl for lvl in train_levels if lvl not in test_levels]
         age_fill = float(np.nanmedian(cov_tr_use[args.age_col].values)) if (args.age_col in cov_tr_use.columns) else None
-        cov_te_aug, Xte_aug, n_add = augment_test_levels(cov_te_use, Xte, args.site_col, missing,
-                                                         age_col=(args.age_col if args.age_col in cov_tr_use.columns else None),
-                                                         age_fill=age_fill)
+        cov_te_aug, Xte_fit_aug, n_add = augment_test_levels(
+            cov_te_use, Xte_fit, args.site_col, missing,
+            age_col=(args.age_col if args.age_col in cov_tr_use.columns else None),
+            age_fill=age_fill
+        )
         if n_add:
             print(f"[info] fold {fold}: added {n_add} dummy test row(s): {missing}", flush=True)
 
-        # Fit/apply
-        Xtr_adj, Xte_adj_full = learn_apply(Xtr, cov_tr_use, Xte_aug, cov_te_aug,
-                                            site_col=args.site_col, age_col=args.age_col if args.mode=="gam" else None,
-                                            mode=args.mode, ref_batch=ref_label)
-        Xte_adj = Xte_adj_full[:Xte.shape[0], :]
-        # Inverse transform & optional clip (OOF test)
+        # Fit/apply on kept columns
+        Xtr_adj_fit, Xte_adj_fit_full = learn_apply(
+            Xtr_fit, cov_tr_use, Xte_fit_aug, cov_te_aug,
+            site_col=args.site_col, age_col=args.age_col if args.mode=="gam" else None,
+            mode=args.mode, ref_batch=ref_label
+        )
+        Xte_adj_fit = Xte_adj_fit_full[:Xte_fit.shape[0], :]
+
+        # Reconstruct TEST full vectors (kept = harmonized; dropped = original transformed)
+        Xte_adj = np.zeros_like(Xte, dtype=np.float32)
+        Xte_adj[:, keep]  = Xte_adj_fit
+        Xte_adj[:, ~keep] = Xte[:, ~keep]
+
+        # Inverse transform & cleanup
         Xte_adj = inverse_transform(Xte_adj, pre_tf).astype(np.float32)
         if args.clip_nonneg and modality == "dwi":
             Xte_adj = np.maximum(Xte_adj, 0.0)
+        Xte_adj = nan_fix_dwi(Xte_adj) if modality == "dwi" else nan_fix_fmri(Xte_adj)
 
         # Write OOF TEST matrices + cache post vectors
         te_ids = ids_all[te]
@@ -584,14 +611,19 @@ def main():
             np.savetxt(oof_dir / f"{sid}_harmonized.csv", A, fmt="%.6g", delimiter=",")
             post_vecs[str(sid)] = v.copy()
 
-        # Optional per-fold dumps
+        # Optional per-fold dumps (TRAIN/TEST)
         if args.save_folds:
             dtr = folds_root / f"fold{fold:02d}_train"; dtr.mkdir(parents=True, exist_ok=True)
             dte = folds_root / f"fold{fold:02d}_test" ; dte.mkdir(parents=True, exist_ok=True)
-            # Train (need to inverse transform train too for saving)
-            Xtr_adj_inv = inverse_transform(Xtr_adj, pre_tf).astype(np.float32)
+            # Inverse/cleanup TRAIN too
+            Xtr_adj_full = np.zeros_like(Xtr, dtype=np.float32)
+            Xtr_adj_full[:, keep]  = Xtr_adj_fit
+            Xtr_adj_full[:, ~keep] = Xtr[:, ~keep]
+            Xtr_adj_inv = inverse_transform(Xtr_adj_full, pre_tf).astype(np.float32)
             if args.clip_nonneg and modality == "dwi":
                 Xtr_adj_inv = np.maximum(Xtr_adj_inv, 0.0)
+            Xtr_adj_inv = nan_fix_dwi(Xtr_adj_inv) if modality == "dwi" else nan_fix_fmri(Xtr_adj_inv)
+
             tr_ids = ids_all[tr]
             for sid, v in zip(tr_ids, Xtr_adj_inv):
                 A = np.zeros((N,N), dtype=float); A[r_idx, c_idx] = v; A[c_idx, r_idx] = v; np.fill_diagonal(A, 0.0)
@@ -602,16 +634,21 @@ def main():
 
         # Diagnostics per fold
         if args.diagnostics:
-            # Compare on original scale (use X_pre_for_plots for PRE)
             Xtr_pre = X_pre_for_plots[tr]; Xte_pre = X_pre_for_plots[te]
             # AUC pre
             Xtr_s, Xte_s = sanitize_for_auc(Xtr_pre, Xte_pre)
             Xtr_s, Xte_s = subsample_features(Xtr_s, Xte_s, args.auc_max_features, seed=args.seed)
             pre_auc = site_auc_on_test(Xtr_s, sites[tr], Xte_s, sites[te])
             # AUC post
-            Xtr_post = inverse_transform(Xtr_adj, pre_tf).astype(np.float32)
+            # reconstruct TRAIN post on original scale for AUC
+            Xtr_adj_full = np.zeros_like(Xtr, dtype=np.float32)
+            Xtr_adj_full[:, keep]  = Xtr_adj_fit
+            Xtr_adj_full[:, ~keep] = Xtr[:, ~keep]
+            Xtr_post = inverse_transform(Xtr_adj_full, pre_tf).astype(np.float32)
             if args.clip_nonneg and modality == "dwi":
                 Xtr_post = np.maximum(Xtr_post, 0.0)
+            Xtr_post = nan_fix_dwi(Xtr_post) if modality == "dwi" else nan_fix_fmri(Xtr_post)
+
             Xtr_s, Xte_s = sanitize_for_auc(Xtr_post, Xte_adj)
             Xtr_s, Xte_s = subsample_features(Xtr_s, Xte_s, args.auc_max_features, seed=args.seed)
             post_auc = site_auc_on_test(Xtr_s, sites[tr], Xte_s, sites[te])
@@ -671,7 +708,6 @@ def main():
             sample = rng.choice(candidates, size=min(args.subject_plots, len(candidates)), replace=False)
             plots_dir = Path(args.plots_dir) if args.plots_dir else Path(args.out_dir) / f"{args.prefix}_subject_plots"
             plots_dir.mkdir(parents=True, exist_ok=True)
-            # Need pre vectors in original scale for these subjects
             id_to_idx: Dict[str,int] = {sid: i for i, sid in enumerate(ids_all)}
             for sid in pbar_iter(sample, total=len(sample), desc="Plot subjects", enable=progress):
                 i = id_to_idx[sid]
