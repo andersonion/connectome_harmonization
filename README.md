@@ -3,9 +3,7 @@ Conda (Miniconda/Mambaforge recommended)
 
 One-time setup
 from the repo root (where environment.yml lives)
-```bash
-bash ./setup_env.sh
-```
+```bash bash ./setup_env.sh```
 To activate env:
 ```bash
 conda activate ./.envs/neuroharmonize-env
