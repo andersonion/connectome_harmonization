@@ -17,17 +17,45 @@ bash ./verify_environment.sh
 
 Notes
 
-Modality: --modality dwi uses log1p/expm1; --modality fmri uses Fisher z (arctanh/tanh).
+Modality: 
+```bash
+--modality dwi
+```
+uses log1p/expm1; 
 
-Anchoring: set --ref-site to the exact SITE string present after merging (e.g., ADDecode:1).
+```bash
+--modality fmri
+```
+uses Fisher z (arctanh/tanh).
 
-Merging: --min-per-site controls rare site merge into OTHER (REF is preserved).
+Anchoring: set
+```bash
+--ref-site
+```
+to the exact SITE string present after merging (e.g., ADDecode:1).
 
-Ridge: --ridge stabilizes the OLS; 1e-3 is a safe default.
+Merging:
+```bash
+--min-per-site
+```
+controls rare site merge into OTHER (REF is preserved).
 
-QC: add --qc to emit auc_site.txt, mean_to_ref_distances.csv, pca_pre.png, pca_post.png, and a few subject panels under <out-dir>/<prefix>_qc/.
+Ridge:
+```bash
+--ridge
+```
+stabilizes the OLS; 1e-3 is a safe default.
 
---ref-site must match a SITE value in your covars after rare-site merging. You can also anchor to something like "UNIVERSITY_NORTH_TEXAS_HS" by changing that flag.
+QC: add
+```bash
+--qc
+```
+to emit auc_site.txt, mean_to_ref_distances.csv, pca_pre.png, pca_post.png, and a few subject panels under <out-dir>/<prefix>_qc/.
+
+```bash
+--ref-site
+```
+must match a SITE value in your covars after rare-site merging. You can also anchor to something like "UNIVERSITY_NORTH_TEXAS_HS" by changing that flag.
 
 fMRI input: if your fMRI edges are already Fisher-z, convert back to r via tanh(z) before running (the script does Fisher-z internally). I can drop a one-liner if you need it.
 
