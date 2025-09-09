@@ -2,26 +2,28 @@
 # -*- coding: utf-8 -*-
 
 """
-Fold-wise ComBat / ComBat-GAM with per-subject matrix outputs
-+ optional diagnostics (AUC/PCA) and subject comparison plots.
+Fold-wise ComBat / ComBat-GAM that writes per-subject matrices (N×N),
+optionally runs diagnostics (AUC/PCA), and makes subject pre/post/diff plots.
+
+- Works with numeric features (id + edges...) or a manifest (id, filepath)
+  of per-subject matrices to vectorize (upper triangle, k=1).
+- Supports DWI (non-negative weights): log1p -> harmonize -> expm1 (+clip)
+- Supports fMRI (signed correlations): no transform; negatives preserved.
 
 Modes:
-  - OOF (no leakage): --cv-folds > 0
-  - Full-fit:         --cv-folds 0 (fits once on all, applies to all)
+  * OOF (no leakage): --cv-folds > 0  → writes {prefix}_matrices_oof/<ID>_harmonized.csv
+  * Full-fit:         --cv-folds 0    → writes {prefix}_matrices_full/<ID>_harmonized.csv
 
-Outputs:
-  - Per-subject harmonized N×N matrices (CSV) in:
-      {out_dir}/{prefix}_matrices_oof/   (OOF)
-      {out_dir}/{prefix}_matrices_full/  (full-fit)
-  - Diagnostics (if --diagnostics):
-      AUC summary CSV: {out_dir}/{prefix}_cv_auc.csv
-      PCA plots/CSVs per fold: {out_dir}/{prefix}_fold{NN}_pca_{pre,post}.{png,csv}
-  - Subject comparison plots (if --subject-plots N):
-      {out_dir}/{prefix}_subject_plots/{SUBJ}_pre_post_diff.png
+Diagnostics (if --diagnostics):
+  * AUC pre/post per fold → {prefix}_cv_auc.csv
+  * PCA pre/post per fold (if --pca) → CSV+PNG per fold
+
+Subject plots (if --subject-plots N):
+  * {prefix}_subject_plots/{ID}_pre_post_diff.png
 """
 
 from __future__ import annotations
-import argparse, logging, sys, math, warnings, os
+import argparse, logging, math, sys, warnings, os
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 
@@ -38,19 +40,20 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.decomposition import PCA
 
-# Plotting
+# Plotting (headless)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
+from matplotlib.colors import LogNorm, SymLogNorm, TwoSlopeNorm
 
-# Progress (optional)
+# Progress
 try:
     from tqdm import tqdm
 except Exception:
     tqdm = None
 
-# ----------------------------- UX / Logging ----------------------------- #
+
+# ----------------------------- Logging/UX ----------------------------- #
 
 def setup_logging(v: int) -> None:
     level = logging.WARNING if v <= 0 else logging.INFO if v == 1 else logging.DEBUG
@@ -64,7 +67,8 @@ def pbar_iter(it, total=None, desc="", enable=True):
         return tqdm(it, total=total, desc=desc, ncols=90)
     return it
 
-# ----------------------- File / Vectorization utils --------------------- #
+
+# ---------------------- Feature I/O & Vectorization -------------------- #
 
 def _read_noheader_matrix(fp: str) -> np.ndarray:
     try:
@@ -116,13 +120,12 @@ def read_features(features_path: Path, id_col: str, manifest_vectorize: bool, pr
     num = df.drop(columns=[id_col]).apply(pd.to_numeric, errors="coerce")
     if num.isnull().any().any():
         bad = [c for c in num.columns if num[c].isnull().any()]
-        logging.warning("Dropping %d non-numeric/NaN feature columns: %s",
-                        len(bad), ", ".join(bad[:8]) + ("..." if len(bad) > 8 else ""))
-        num = num.drop(columns=bad)
+        raise SystemExit(f"Found NaNs in features (columns like {bad[:5]}). Clean your features first.")
     out = pd.concat([id_series, num], axis=1)
     return out, None
 
 def infer_nodes_from_edges(m: int) -> Optional[int]:
+    # Solve m = N*(N-1)/2
     disc = 1 + 8*m
     rt = int(math.isqrt(disc))
     if rt*rt != disc: return None
@@ -139,7 +142,35 @@ def unvectorize_upper(vec: np.ndarray, N: int) -> np.ndarray:
     np.fill_diagonal(A, 0.0)
     return A
 
-# --------------------- Harmonization plumbing --------------------------- #
+
+# ------------------------- Modality & Transforms ------------------------ #
+
+def forward_transform(X: np.ndarray, kind: str) -> np.ndarray:
+    if kind == "log1p":
+        return np.log1p(np.maximum(X, 0.0))
+    return X
+
+def inverse_transform(X: np.ndarray, kind: str) -> np.ndarray:
+    if kind == "log1p":
+        return np.expm1(X)
+    return X
+
+def resolve_pretransform(modality: str, pre_transform: str, X_preview: np.ndarray) -> str:
+    """
+    Decide transform: explicit pre_transform wins; else modality; else auto.
+    Auto: if any negative in X → 'none', else 'log1p'.
+    """
+    if pre_transform != "auto":
+        return pre_transform
+    if modality == "dwi":
+        return "log1p"
+    if modality == "fmri":
+        return "none"
+    # auto
+    return "none" if np.nanmin(X_preview) < 0 else "log1p"
+
+
+# -------------------------- Harmonization core -------------------------- #
 
 def learn_apply(Xtr: np.ndarray, cov_tr: pd.DataFrame,
                 Xte: np.ndarray, cov_te: pd.DataFrame,
@@ -182,6 +213,7 @@ def augment_test_levels(cov_te: pd.DataFrame, Xte: np.ndarray,
     base = Xte[0:1] if Xte.shape[0] else np.zeros((1, Xte.shape[1]), dtype=np.float32)
     X_aug = np.vstack([Xte, np.repeat(base, len(missing), axis=0)]).astype(np.float32)
     return cov_aug, X_aug, len(missing)
+
 
 # ----------------------- Diagnostics helpers (AUC/PCA) ------------------ #
 
@@ -231,26 +263,40 @@ def pca_scatter(df: pd.DataFrame, title: str, out_png: Path):
     plt.xlabel("PC1"); plt.ylabel("PC2"); plt.title(title)
     plt.tight_layout(); plt.savefig(out_png, dpi=150); plt.close()
 
-# ---------------------- Subject plot helper (3-panel) ------------------- #
 
-def plot_subject_triptych(A_pre: np.ndarray, A_post: np.ndarray, sid: str, out_png: Path, eps: float = 1e-6):
-    vmax = max(eps, float(np.nanmax(A_pre)), float(np.nanmax(A_post)))
+# ----------------------- Subject plotting helpers ---------------------- #
+
+def auto_norm_for_panel(A: np.ndarray, modality: str, eps: float = 1e-6):
+    vmin, vmax = float(np.nanmin(A)), float(np.nanmax(A))
+    if modality == "dwi":
+        pos = A[A > 0]
+        vmin_pos = float(pos.min()) if pos.size else eps
+        return LogNorm(vmin=max(eps, vmin_pos), vmax=max(eps, vmax))
+    # fmri (signed)
+    M = float(max(abs(vmin), abs(vmax), 1e-6))
+    return SymLogNorm(linthresh=1e-3, vmin=-M, vmax=M, base=10)
+
+def plot_subject_triptych(A_pre: np.ndarray, A_post: np.ndarray, sid: str, out_png: Path, modality: str, eps: float = 1e-6):
     D = A_post - A_pre
-    vmaxd = float(np.nanmax(np.abs(D))) if np.isfinite(D).any() else 1.0
+    norm_pre  = auto_norm_for_panel(A_pre,  modality, eps)
+    norm_post = auto_norm_for_panel(A_post, modality, eps)
+    Md = float(max(abs(np.nanmin(D)), abs(np.nanmax(D)), 1e-9))
+    norm_diff = TwoSlopeNorm(vmin=-Md, vcenter=0.0, vmax=Md)
+
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    im0 = axes[0].imshow(A_pre + eps, norm=LogNorm(vmin=eps, vmax=vmax))
-    axes[0].set_title("Pre (log)"); plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-    im1 = axes[1].imshow(A_post + eps, norm=LogNorm(vmin=eps, vmax=vmax))
-    axes[1].set_title("Post (log)"); plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-    im2 = axes[2].imshow(D, vmin=-vmaxd, vmax=vmaxd, cmap="bwr")
-    axes[2].set_title("Post - Pre"); plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
-    for ax in axes: ax.set_xticks([]); ax.set_yticks([])
+    im0 = axes[0].imshow(A_pre,  norm=norm_pre);  axes[0].set_title("Pre")
+    im1 = axes[1].imshow(A_post, norm=norm_post); axes[1].set_title("Post")
+    im2 = axes[2].imshow(D,      norm=norm_diff, cmap="bwr"); axes[2].set_title("Post − Pre")
+    for ax, im in zip(axes, (im0, im1, im2)):
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_xticks([]); ax.set_yticks([])
     fig.suptitle(str(sid)); fig.tight_layout(); fig.savefig(out_png, dpi=150); plt.close(fig)
+
 
 # ---------------------------------- Main -------------------------------- #
 
 def main():
-    ap = argparse.ArgumentParser(description="Harmonize connectomes to per-subject matrices with optional diagnostics.")
+    ap = argparse.ArgumentParser(description="Harmonize connectomes to per-subject matrices with diagnostics & subject plots.")
     ap.add_argument("--features", required=True, help="Numeric edges CSV (id + edges...) OR manifest (id, filepath).")
     ap.add_argument("--covars", required=True, help="Covariates CSV with SITE and AGE.")
     ap.add_argument("--id-col", default="subject_id")
@@ -265,6 +311,15 @@ def main():
                     help="CV only: how to handle tiny SITE classes in CV labels.")
     ap.add_argument("--min-per-site", type=int, default=2, help="CV only: sites with < this many are 'rare'.")
     ap.add_argument("--save-folds", action="store_true", help="Also dump per-fold train/test matrices.")
+
+    # Modality & transforms
+    ap.add_argument("--modality", choices=["auto","dwi","fmri"], default="auto",
+                    help="Choose 'dwi' for non-negative edges (log1p/expm1), 'fmri' for signed edges, or 'auto'.")
+    ap.add_argument("--pre-transform", choices=["auto","none","log1p"], default="auto",
+                    help="Override the transform used before harmonization.")
+    ap.add_argument("--clip-nonneg", action="store_true",
+                    help="After inverse transform (DWI), clip tiny negatives to 0.")
+
     # Diagnostics
     ap.add_argument("--diagnostics", action="store_true", help="Run AUC/PCA diagnostics.")
     ap.add_argument("--auc-max-features", type=int, default=None, help="Subsample this many features for AUC only.")
@@ -272,13 +327,15 @@ def main():
     ap.add_argument("--pca-max-features", type=int, default=None, help="Subsample features for PCA only (defaults to AUC cap).")
     ap.add_argument("--pca-sample", type=int, default=None, help="Randomly subsample this many subjects for PCA plots.")
     ap.add_argument("--diag-folds", type=int, default=3, help="Full-fit only: CV folds for diagnostics.")
+
     # Subject plots
     ap.add_argument("--subject-plots", type=int, default=0, help="If >0, sample N subjects and save pre/post/diff plots.")
     ap.add_argument("--plots-dir", default=None, help="Output directory for subject plots (default inside out_dir).")
-    ap.add_argument("--seed", type=int, default=42, help="Random seed for subsampling.")
+
     # IO / misc
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--prefix", required=True)
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--no-progress", action="store_true")
     ap.add_argument("-v","--verbose", action="count", default=1)
     args = ap.parse_args()
@@ -286,33 +343,29 @@ def main():
     setup_logging(args.verbose)
     progress = not args.no_progress
 
-    # Quiet some noisy (non-fatal) warnings
+    # Tidy noisy warnings (non-fatal)
     warnings.filterwarnings("ignore", message="Degrees of freedom <= 0 for slice", category=RuntimeWarning)
     warnings.filterwarnings("ignore", message="invalid value encountered in divide", category=RuntimeWarning)
 
-    features_path = Path(args.features)
-    covars_path   = Path(args.covars)
-    outdir = Path(args.out_dir); outdir.mkdir(parents=True, exist_ok=True)
-
-    # ------------------ Load & check features ------------------ #
+    # ---------- Load features ---------- #
     banner("LOAD FEATURES")
+    features_path = Path(args.features)
     X_df, N_guess = read_features(features_path, args.id_col, manifest_vectorize=True, progress=progress)
     ids_all = X_df[args.id_col].astype(str).values
-    X_num = X_df.drop(columns=[args.id_col]).apply(pd.to_numeric, errors="coerce")
-    if X_num.isnull().any().any():
-        bad = int(X_num.isnull().any(axis=1).sum())
-        raise SystemExit(f"{bad} row(s) contain NaNs in features after coercion.")
-    m = X_num.shape[1]
+    X_raw = X_df.drop(columns=[args.id_col]).apply(pd.to_numeric, errors="coerce").values.astype(np.float32)
+    if np.isnan(X_raw).any():
+        raise SystemExit("NaNs present in features after coercion. Clean inputs first.")
+    m = X_raw.shape[1]
     N = args.nodes or N_guess or infer_nodes_from_edges(m)
     if N is None:
-        raise SystemExit(f"Cannot infer nodes from {m} edges. Pass --nodes (e.g., --nodes 84).")
-    expected_m = N*(N-1)//2
-    if m != expected_m:
-        raise SystemExit(f"Edge count {m} != expected upper-tri size {expected_m} for N={N}.")
+        raise SystemExit(f"Cannot infer nodes from {m} edges. Pass --nodes (e.g., 84).")
+    if m != N*(N-1)//2:
+        raise SystemExit(f"Edge count {m} does not match upper-tri size {N*(N-1)//2} for N={N}.")
     print(f"INFO: Detected N={N} nodes ({m} edges).", flush=True)
 
-    # ------------------ Load & align covariates ---------------- #
+    # ---------- Load covariates ---------- #
     banner("LOAD COVARIATES")
+    covars_path = Path(args.covars)
     C = pd.read_csv(covars_path)
     if args.id_col not in C.columns:
         raise SystemExit(f"Covars missing id-col '{args.id_col}'.")
@@ -324,27 +377,38 @@ def main():
             ex = C.loc[C[args.age_col].isna(), [args.id_col, args.age_col]].head(5)
             raise SystemExit(f"AGE non-numeric/missing:\n{ex}")
 
+    # Align IDs
     keep_ids = sorted(set(ids_all) & set(C[args.id_col]))
     if not keep_ids:
         raise SystemExit("No overlapping subject IDs between features and covars.")
     order = pd.Index(keep_ids)
-    X = X_num.set_index(pd.Index(ids_all)).loc[order].reset_index(drop=True).values.astype(np.float32)
+    X_raw = pd.DataFrame(X_raw, index=pd.Index(ids_all)).loc[order].values.astype(np.float32)
     C = C.set_index(args.id_col).loc[order].reset_index()
     ids_all = np.array(keep_ids, dtype=str)
+
+    # Decide transform
+    pre_tf = resolve_pretransform(args.modality, args.pre_transform, X_raw[: min(256, len(X_raw))])
+    modality = ("dwi" if pre_tf == "log1p" else "fmri") if args.modality == "auto" else args.modality
+    print(f"INFO: modality={modality}, pre-transform={pre_tf}", flush=True)
+
+    # Keep a copy of PRE (original scale) for plots
+    X_pre_for_plots = X_raw.copy()
+    # Transform for harmonization
+    X = forward_transform(X_raw, pre_tf).astype(np.float32)
 
     ref_label = None if args.ref_batch is None else str(args.ref_batch).strip()
     if ref_label is not None and ref_label not in set(C[args.site_col].unique()):
         top = C[args.site_col].value_counts().head(20)
         raise SystemExit(f"--ref-batch '{ref_label}' not found in SITE. Top labels:\n{top}")
 
-    # For subject plots: we’ll need subject -> row index
-    id_to_idx: Dict[str, int] = {sid: i for i, sid in enumerate(ids_all)}
+    # Precompute tri indices
     r_idx, c_idx = np.triu_indices(N, k=1)
 
-    # -------------------- FULL-FIT vs OOF ---------------------- #
+    # -------------------- FULL-FIT -------------------- #
     if args.cv_folds <= 0:
         banner("FULL FIT")
         cov_use = C[[args.site_col] + ([args.age_col] if args.age_col in C.columns else [])].copy()
+        # Fit/apply
         try:
             model, _ = harmonizationLearn(
                 X, cov_use,
@@ -361,26 +425,31 @@ def main():
                 ref_batch=ref_label
             )
             X_adj = harmonizationApply(X, cov_old, model)
+        # Inverse transform (back to original units)
+        X_adj = inverse_transform(X_adj, pre_tf).astype(np.float32)
+        if args.clip_nonneg and modality == "dwi":
+            X_adj = np.maximum(X_adj, 0.0)
 
-        # Write one matrix per subject
-        mat_dir = outdir / f"{args.prefix}_matrices_full"
+        # Write matrices
+        mat_dir = Path(args.out_dir) / f"{args.prefix}_matrices_full"
         mat_dir.mkdir(parents=True, exist_ok=True)
         for sid, v in pbar_iter(zip(ids_all, X_adj), total=len(ids_all), desc="Writing matrices", enable=progress):
             A = np.zeros((N,N), dtype=float); A[r_idx, c_idx] = v; A[c_idx, r_idx] = v; np.fill_diagonal(A, 0.0)
             np.savetxt(mat_dir / f"{sid}_harmonized.csv", A, fmt="%.6g", delimiter=",")
 
-        # Diagnostics (optional): run a CV over pre/post to report AUC/PCA
+        # Diagnostics (optional): run small CV on PRE vs POST
         if args.diagnostics:
             banner("DIAGNOSTICS (full-fit)")
             n_splits = max(2, int(args.diag_folds))
             skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=args.seed)
             sites = C[args.site_col].astype(str).values
-            per_fold = []
+            per = []
             for fold, (tr, te) in enumerate(skf.split(np.arange(len(C)), sites), start=1):
-                Xtr, Xte = X[tr], X[te]
+                # PRE/POST on original scale
+                Xtr_pre, Xte_pre = X_pre_for_plots[tr], X_pre_for_plots[te]
                 Xtr_post, Xte_post = X_adj[tr], X_adj[te]
                 # AUC pre
-                Xtr_s, Xte_s = sanitize_for_auc(Xtr, Xte)
+                Xtr_s, Xte_s = sanitize_for_auc(Xtr_pre, Xte_pre)
                 Xtr_s, Xte_s = subsample_features(Xtr_s, Xte_s, args.auc_max_features, seed=args.seed)
                 pre_auc = site_auc_on_test(Xtr_s, sites[tr], Xte_s, sites[te])
                 # AUC post
@@ -391,24 +460,22 @@ def main():
                 if args.pca:
                     k = args.pca_max_features if args.pca_max_features is not None else args.auc_max_features
                     # PRE
-                    Xtr_v, Xte_v = sanitize_for_auc(Xtr, Xte)
+                    Xtr_v, Xte_v = sanitize_for_auc(Xtr_pre, Xte_pre)
                     Xtr_v, Xte_v = subsample_features(Xtr_v, Xte_v, k, seed=args.seed)
                     Z = PCA(n_components=2, svd_solver="randomized", random_state=args.seed).fit_transform(
                         np.vstack([Xtr_v, Xte_v])
                     )
                     Ztr, Zte = Z[:len(tr)], Z[len(tr):]
                     df_pre = pd.DataFrame({
-                        "PC1": np.r_[Ztr[:,0], Zte[:,0]],
-                        "PC2": np.r_[Ztr[:,1], Zte[:,1]],
+                        "PC1": np.r_[Ztr[:,0], Zte[:,0]], "PC2": np.r_[Ztr[:,1], Zte[:,1]],
                         "SITE": np.r_[sites[tr], sites[te]],
                         "split": ["train"]*len(tr) + ["test"]*len(te),
                     })
                     if args.pca_sample and len(df_pre) > args.pca_sample:
                         df_pre = df_pre.sample(n=args.pca_sample, random_state=args.seed).reset_index(drop=True)
-                    pre_csv = outdir / f"{args.prefix}_fold{fold:02d}_pca_pre.csv"
-                    pre_png = outdir / f"{args.prefix}_fold{fold:02d}_pca_pre.png"
-                    df_pre.to_csv(pre_csv, index=False)
-                    pca_scatter(df_pre, f"PCA pre (fold {fold})", pre_png)
+                    pre_csv = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_pca_pre.csv"
+                    pre_png = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_pca_pre.png"
+                    df_pre.to_csv(pre_csv, index=False); pca_scatter(df_pre, f"PCA pre (fold {fold})", pre_png)
                     # POST
                     Xtr_v, Xte_v = sanitize_for_auc(Xtr_post, Xte_post)
                     Xtr_v, Xte_v = subsample_features(Xtr_v, Xte_v, k, seed=args.seed)
@@ -417,42 +484,35 @@ def main():
                     )
                     Ztr, Zte = Z[:len(tr)], Z[len(tr):]
                     df_post = pd.DataFrame({
-                        "PC1": np.r_[Ztr[:,0], Zte[:,0]],
-                        "PC2": np.r_[Ztr[:,1], Zte[:,1]],
+                        "PC1": np.r_[Ztr[:,0], Zte[:,0]], "PC2": np.r_[Ztr[:,1], Zte[:,1]],
                         "SITE": np.r_[sites[tr], sites[te]],
                         "split": ["train"]*len(tr) + ["test"]*len(te),
                     })
                     if args.pca_sample and len(df_post) > args.pca_sample:
                         df_post = df_post.sample(n=args.pca_sample, random_state=args.seed).reset_index(drop=True)
-                    post_csv = outdir / f"{args.prefix}_fold{fold:02d}_pca_post.csv"
-                    post_png = outdir / f"{args.prefix}_fold{fold:02d}_pca_post.png"
-                    df_post.to_csv(post_csv, index=False)
-                    pca_scatter(df_post, f"PCA post (fold {fold})", post_png)
-                per_fold.append({"fold": fold, "pre_auc": float(pre_auc), "post_auc": float(post_auc)})
+                    post_csv = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_pca_post.csv"
+                    post_png = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_pca_post.png"
+                    df_post.to_csv(post_csv, index=False); pca_scatter(df_post, f"PCA post (fold {fold})", post_png)
+                per.append({"fold": fold, "pre_auc": float(pre_auc), "post_auc": float(post_auc)})
+            pd.DataFrame(per).to_csv(Path(args.out_dir) / f"{args.prefix}_cv_auc.csv", index=False)
+            print(f"Wrote AUC summary to {Path(args.out_dir) / (args.prefix + '_cv_auc.csv')}", flush=True)
 
-            res = pd.DataFrame(per_fold)
-            res.to_csv(outdir / f"{args.prefix}_cv_auc.csv", index=False)
-            print(f"Wrote AUC summary to {outdir / (args.prefix + '_cv_auc.csv')}", flush=True)
-
-        # Subject triptychs (optional; uses full-fit post vectors)
+        # Subject plots
         if args.subject_plots and args.subject_plots > 0:
             banner("SUBJECT PLOTS")
             rng = np.random.default_rng(args.seed)
-            candidates = ids_all.tolist()
-            n = min(args.subject_plots, len(candidates))
-            sample = rng.choice(candidates, size=n, replace=False)
-            plots_dir = Path(args.plots_dir) if args.plots_dir else outdir / f"{args.prefix}_subject_plots"
+            sample = rng.choice(ids_all, size=min(args.subject_plots, len(ids_all)), replace=False)
+            plots_dir = Path(args.plots_dir) if args.plots_dir else Path(args.out_dir) / f"{args.prefix}_subject_plots"
             plots_dir.mkdir(parents=True, exist_ok=True)
             for sid in pbar_iter(sample, total=len(sample), desc="Plot subjects", enable=progress):
-                i = id_to_idx[sid]
-                A_pre  = unvectorize_upper(X[i], N)
-                A_post = unvectorize_upper(X_adj[i], N)
-                plot_subject_triptych(A_pre, A_post, sid, plots_dir / f"{sid}_pre_post_diff.png")
-
-        print(f"Wrote {len(ids_all)} matrices to {outdir / f'{args.prefix}_matrices_full'}")
+                i = int(np.where(ids_all == sid)[0][0])
+                A_pre  = unvectorize_upper(X_pre_for_plots[i], N)
+                A_post = unvectorize_upper(X_adj[i],            N)
+                plot_subject_triptych(A_pre, A_post, sid, plots_dir / f"{sid}_pre_post_diff.png", modality=modality)
+        print(f"Wrote {len(ids_all)} matrices to {Path(args.out_dir) / f'{args.prefix}_matrices_full'}")
         return
 
-    # -------------------- OOF: CV-based harmonization -------------------- #
+    # ---------------------- OOF (no leakage) ---------------------- #
     banner("CV OOF")
     sites = C[args.site_col].astype(str).values
     vc = pd.Series(sites).value_counts()
@@ -460,10 +520,10 @@ def main():
     if args.cv_handle_rare == "drop" and rare:
         keep_mask = ~pd.Series(sites).isin(rare)
         X = X[keep_mask.values]
+        X_pre_for_plots = X_pre_for_plots[keep_mask.values]
         C = C.loc[keep_mask.values].reset_index(drop=True)
         sites = C[args.site_col].astype(str).values
         ids_all = ids_all[keep_mask.values]
-        id_to_idx = {sid: i for i, sid in enumerate(ids_all)}
         logging.info("Dropped rare sites for CV: %s", rare)
     elif args.cv_handle_rare == "merge" and rare:
         sites = np.where(pd.Series(sites).isin(rare), "OTHER", sites)
@@ -474,18 +534,17 @@ def main():
         print(f"[warn] Reducing folds from {args.cv_folds} to {n_splits} to satisfy class counts.", flush=True)
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=args.seed)
 
-    oof_dir = outdir / f"{args.prefix}_matrices_oof"
+    oof_dir = Path(args.out_dir) / f"{args.prefix}_matrices_oof"
     oof_dir.mkdir(parents=True, exist_ok=True)
     if args.save_folds:
-        folds_root = outdir / f"{args.prefix}_matrices_folds"; folds_root.mkdir(parents=True, exist_ok=True)
+        folds_root = Path(args.out_dir) / f"{args.prefix}_matrices_folds"; folds_root.mkdir(parents=True, exist_ok=True)
 
-    # For diagnostics & subject plots
     per_fold_auc = []
     post_vecs: Dict[str, np.ndarray] = {}
 
     for fold, (tr, te) in enumerate(skf.split(np.arange(len(C)), sites), start=1):
         Xtr = X[tr].astype(np.float32); Xte = X[te].astype(np.float32)
-        cov_tr = C.iloc[tr].copy(); cov_te = C.iloc[te].copy()
+        cov_tr = C.iloc[tr].copy();     cov_te = C.iloc[te].copy()
 
         keep_cols = [args.site_col]; 
         if args.age_col in cov_tr.columns: keep_cols.append(args.age_col)
@@ -497,6 +556,7 @@ def main():
             if cov_tr_use[args.age_col].isna().any() or cov_te_use[args.age_col].isna().any():
                 raise SystemExit("Non-numeric AGE encountered after split.")
 
+        # Ensure TEST has all TRAIN batches (legacy apply quirk)
         train_levels = sorted(cov_tr_use[args.site_col].astype(str).unique().tolist())
         test_levels  = set(cov_te_use[args.site_col].astype(str))
         missing = [lvl for lvl in train_levels if lvl not in test_levels]
@@ -512,42 +572,56 @@ def main():
                                             site_col=args.site_col, age_col=args.age_col if args.mode=="gam" else None,
                                             mode=args.mode, ref_batch=ref_label)
         Xte_adj = Xte_adj_full[:Xte.shape[0], :]
+        # Inverse transform & optional clip (OOF test)
+        Xte_adj = inverse_transform(Xte_adj, pre_tf).astype(np.float32)
+        if args.clip_nonneg and modality == "dwi":
+            Xte_adj = np.maximum(Xte_adj, 0.0)
 
-        # Write OOF matrices for TEST subjects + cache post vectors for plots
+        # Write OOF TEST matrices + cache post vectors
         te_ids = ids_all[te]
         for sid, v in pbar_iter(zip(te_ids, Xte_adj), total=len(te_ids), desc=f"Fold {fold}/{n_splits} write TEST", enable=progress):
             A = np.zeros((N,N), dtype=float); A[r_idx, c_idx] = v; A[c_idx, r_idx] = v; np.fill_diagonal(A, 0.0)
             np.savetxt(oof_dir / f"{sid}_harmonized.csv", A, fmt="%.6g", delimiter=",")
             post_vecs[str(sid)] = v.copy()
 
-        # Optional fold dumps (train/test)
+        # Optional per-fold dumps
         if args.save_folds:
             dtr = folds_root / f"fold{fold:02d}_train"; dtr.mkdir(parents=True, exist_ok=True)
             dte = folds_root / f"fold{fold:02d}_test" ; dte.mkdir(parents=True, exist_ok=True)
+            # Train (need to inverse transform train too for saving)
+            Xtr_adj_inv = inverse_transform(Xtr_adj, pre_tf).astype(np.float32)
+            if args.clip_nonneg and modality == "dwi":
+                Xtr_adj_inv = np.maximum(Xtr_adj_inv, 0.0)
             tr_ids = ids_all[tr]
-            for sid, v in zip(tr_ids, Xtr_adj):
+            for sid, v in zip(tr_ids, Xtr_adj_inv):
                 A = np.zeros((N,N), dtype=float); A[r_idx, c_idx] = v; A[c_idx, r_idx] = v; np.fill_diagonal(A, 0.0)
                 np.savetxt(dtr / f"{sid}_harmonized.csv", A, fmt="%.6g", delimiter=",")
             for sid, v in zip(te_ids, Xte_adj):
                 A = np.zeros((N,N), dtype=float); A[r_idx, c_idx] = v; A[c_idx, r_idx] = v; np.fill_diagonal(A, 0.0)
                 np.savetxt(dte / f"{sid}_harmonized.csv", A, fmt="%.6g", delimiter=",")
 
-        # Diagnostics per fold (AUC/PCA)
+        # Diagnostics per fold
         if args.diagnostics:
+            # Compare on original scale (use X_pre_for_plots for PRE)
+            Xtr_pre = X_pre_for_plots[tr]; Xte_pre = X_pre_for_plots[te]
             # AUC pre
-            Xtr_s, Xte_s = sanitize_for_auc(Xtr, Xte)
+            Xtr_s, Xte_s = sanitize_for_auc(Xtr_pre, Xte_pre)
             Xtr_s, Xte_s = subsample_features(Xtr_s, Xte_s, args.auc_max_features, seed=args.seed)
             pre_auc = site_auc_on_test(Xtr_s, sites[tr], Xte_s, sites[te])
             # AUC post
-            Xtr_s, Xte_s = sanitize_for_auc(Xtr_adj, Xte_adj)
+            Xtr_post = inverse_transform(Xtr_adj, pre_tf).astype(np.float32)
+            if args.clip_nonneg and modality == "dwi":
+                Xtr_post = np.maximum(Xtr_post, 0.0)
+            Xtr_s, Xte_s = sanitize_for_auc(Xtr_post, Xte_adj)
             Xtr_s, Xte_s = subsample_features(Xtr_s, Xte_s, args.auc_max_features, seed=args.seed)
             post_auc = site_auc_on_test(Xtr_s, sites[tr], Xte_s, sites[te])
             per_fold_auc.append({"fold": fold, "pre_auc": float(pre_auc), "post_auc": float(post_auc)})
+
             # PCA
             if args.pca:
                 k = args.pca_max_features if args.pca_max_features is not None else args.auc_max_features
                 # PRE
-                Xtr_v, Xte_v = sanitize_for_auc(Xtr, Xte)
+                Xtr_v, Xte_v = sanitize_for_auc(Xtr_pre, Xte_pre)
                 Xtr_v, Xte_v = subsample_features(Xtr_v, Xte_v, k, seed=args.seed)
                 Z = PCA(n_components=2, svd_solver="randomized", random_state=args.seed).fit_transform(
                     np.vstack([Xtr_v, Xte_v])
@@ -560,11 +634,11 @@ def main():
                 })
                 if args.pca_sample and len(df_pre) > args.pca_sample:
                     df_pre = df_pre.sample(n=args.pca_sample, random_state=args.seed).reset_index(drop=True)
-                pre_csv = outdir / f"{args.prefix}_fold{fold:02d}_pca_pre.csv"
-                pre_png = outdir / f"{args.prefix}_fold{fold:02d}_pca_pre.png"
+                pre_csv = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_pca_pre.csv"
+                pre_png = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_pca_pre.png"
                 df_pre.to_csv(pre_csv, index=False); pca_scatter(df_pre, f"PCA pre (fold {fold})", pre_png)
                 # POST
-                Xtr_v, Xte_v = sanitize_for_auc(Xtr_adj, Xte_adj)
+                Xtr_v, Xte_v = sanitize_for_auc(Xtr_post, Xte_adj)
                 Xtr_v, Xte_v = subsample_features(Xtr_v, Xte_v, k, seed=args.seed)
                 Z = PCA(n_components=2, svd_solver="randomized", random_state=args.seed).fit_transform(
                     np.vstack([Xtr_v, Xte_v])
@@ -577,17 +651,16 @@ def main():
                 })
                 if args.pca_sample and len(df_post) > args.pca_sample:
                     df_post = df_post.sample(n=args.pca_sample, random_state=args.seed).reset_index(drop=True)
-                post_csv = outdir / f"{args.prefix}_fold{fold:02d}_pca_post.csv"
-                post_png = outdir / f"{args.prefix}_fold{fold:02d}_pca_post.png"
+                post_csv = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_pca_post.csv"
+                post_png = Path(args.out_dir) / f"{args.prefix}_fold{fold:02d}_pca_post.png"
                 df_post.to_csv(post_csv, index=False); pca_scatter(df_post, f"PCA post (fold {fold})", post_png)
 
-    # AUC summary (OOF mode)
+    # Save AUC summary (OOF)
     if args.diagnostics and len(per_fold_auc):
-        res = pd.DataFrame(per_fold_auc)
-        res.to_csv(outdir / f"{args.prefix}_cv_auc.csv", index=False)
-        print(f"Wrote AUC summary to {outdir / (args.prefix + '_cv_auc.csv')}", flush=True)
+        pd.DataFrame(per_fold_auc).to_csv(Path(args.out_dir) / f"{args.prefix}_cv_auc.csv", index=False)
+        print(f"Wrote AUC summary to {Path(args.out_dir) / (args.prefix + '_cv_auc.csv')}", flush=True)
 
-    # Subject triptychs (OOF): sample among subjects with post vectors
+    # Subject plots (OOF)
     if args.subject_plots and args.subject_plots > 0:
         banner("SUBJECT PLOTS")
         rng = np.random.default_rng(args.seed)
@@ -595,21 +668,23 @@ def main():
         if not candidates:
             print("[warn] No harmonized OOF subjects found for plotting.", flush=True)
         else:
-            n = min(args.subject_plots, len(candidates))
-            sample = rng.choice(candidates, size=n, replace=False)
-            plots_dir = Path(args.plots_dir) if args.plots_dir else outdir / f"{args.prefix}_subject_plots"
+            sample = rng.choice(candidates, size=min(args.subject_plots, len(candidates)), replace=False)
+            plots_dir = Path(args.plots_dir) if args.plots_dir else Path(args.out_dir) / f"{args.prefix}_subject_plots"
             plots_dir.mkdir(parents=True, exist_ok=True)
+            # Need pre vectors in original scale for these subjects
+            id_to_idx: Dict[str,int] = {sid: i for i, sid in enumerate(ids_all)}
             for sid in pbar_iter(sample, total=len(sample), desc="Plot subjects", enable=progress):
                 i = id_to_idx[sid]
-                A_pre  = unvectorize_upper(X[i], N)
-                A_post = unvectorize_upper(post_vecs[sid], N)
-                plot_subject_triptych(A_pre, A_post, sid, plots_dir / f"{sid}_pre_post_diff.png")
+                A_pre  = unvectorize_upper(X_pre_for_plots[i], N)
+                A_post = unvectorize_upper(post_vecs[sid],      N)
+                plot_subject_triptych(A_pre, A_post, sid, plots_dir / f"{sid}_pre_post_diff.png", modality=modality)
 
-    # Final count
-    oof_dir = outdir / f"{args.prefix}_matrices_oof"
-    n_written = sum(1 for _ in oof_dir.glob("*.csv")) if oof_dir.exists() else 0
-    if n_written:
-        print(f"Wrote OOF matrices for {n_written} subjects to {oof_dir}", flush=True)
+    # Final count (OOF)
+    oof_dir = Path(args.out_dir) / f"{args.prefix}_matrices_oof"
+    if oof_dir.exists():
+        n_written = sum(1 for _ in oof_dir.glob("*.csv"))
+        if n_written:
+            print(f"Wrote OOF matrices for {n_written} subjects to {oof_dir}", flush=True)
 
 
 if __name__ == "__main__":
