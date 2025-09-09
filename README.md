@@ -1,9 +1,15 @@
 Requirements:
 Conda (Miniconda/Mambaforge recommended)
 
-One-time setup from the repo root (where environment.yml lives) ```bash ./setup_env.sh```
+One-time setup from the repo root (where environment.yml lives):
+```bash
+bash ./setup_env.sh
+```
 
-To activate env: ```conda activate ./.envs/neuroharmonize-env```
+To activate env:
+```bash
+conda activate ./.envs/neuroharmonize-env
+```
 To verify environment has been setup successfully:
 ```bash
 bash ./verify_environment.sh
@@ -12,43 +18,28 @@ bash ./verify_environment.sh
 Notes
 
 Modality: 
-```bash
---modality dwi
-```
+``` --modality dwi ```
 uses log1p/expm1; 
-
-```bash
---modality fmri
-```
+``` --modality fmri ```
 uses Fisher z (arctanh/tanh).
 
 Anchoring: set
-```bash
---ref-site
-```
+``` --ref-site ```
 to the exact SITE string present after merging (e.g., ADDecode:1).
 
 Merging:
-```bash
---min-per-site
-```
+``` --min-per-site ```
 controls rare site merge into OTHER (REF is preserved).
 
 Ridge:
-```bash
---ridge
-```
+``` --ridge ```
 stabilizes the OLS; 1e-3 is a safe default.
 
 QC: add
-```bash
---qc
-```
+``` --qc ```
 to emit auc_site.txt, mean_to_ref_distances.csv, pca_pre.png, pca_post.png, and a few subject panels under <out-dir>/<prefix>_qc/.
 
-```bash
---ref-site
-```
+``` --ref-site ```
 must match a SITE value in your covars after rare-site merging. You can also anchor to something like "UNIVERSITY_NORTH_TEXAS_HS" by changing that flag.
 
 fMRI input: if your fMRI edges are already Fisher-z, convert back to r via tanh(z) before running (the script does Fisher-z internally). I can drop a one-liner if you need it.
